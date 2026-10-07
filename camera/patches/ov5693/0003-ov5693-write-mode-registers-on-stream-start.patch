@@ -1,0 +1,19 @@
+ov5693: write mode registers on stream start
+
+--- a/ov5693.c	2026-10-06 19:41:38.738573321 +0200
++++ b/ov5693.c	2026-10-06 19:41:38.751181962 +0200
+@@ -1095,6 +1095,14 @@
+ 		}
+ 
+ 		mutex_lock(&ov5693->lock);
++		/* Mode is otherwise only written on runtime resume. */
++		ret = ov5693_mode_configure(ov5693);
++		if (ret) {
++			dev_err(ov5693->dev, "s_stream: mode configure failed: %d\n", ret);
++			mutex_unlock(&ov5693->lock);
++			goto err_power_down;
++		}
++
+ 		ret = __v4l2_ctrl_handler_setup(&ov5693->ctrls.handler);
+ 		if (ret) {
+ 			dev_err(ov5693->dev, "s_stream: ctrl setup failed: %d\n", ret);

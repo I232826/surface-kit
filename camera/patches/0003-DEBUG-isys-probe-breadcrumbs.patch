@@ -1,0 +1,121 @@
+From: surface-kit
+Subject: [PATCH] DEBUG: ipu4 isys probe/power-up breadcrumbs
+
+Temporary. dev_notice() before every hardware-touching step of isys probe,
+runtime resume and isys_setup_hw, so the last line on a console shows
+which call hard-freezes the machine. Drop once found.
+
+---
+--- a/ipu-isys.c
++++ b/ipu-isys.c
+@@ -463,6 +463,7 @@
+ {
+ 	struct ipu_isys *isys =
+ 		container_of(notifier, struct ipu_isys, notifier);
++	pr_notice("intel-ipu4-isys: SKDBG notifier_bound %s\n", sd->name);
+ 	struct sensor_async_sd *s_asd =
+ 		container_of(asd, struct sensor_async_sd, asd);
+ 	int ret;
+@@ -580,6 +581,7 @@
+ 
+ 	media_device_init(&isys->media_dev);
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: media_device_register\n");
+ 	rval = media_device_register(&isys->media_dev);
+ 	if (rval < 0) {
+ 		dev_info(&isys->adev->dev, "can't register media device\n");
+@@ -588,22 +590,27 @@
+ 
+ 	isys->v4l2_dev.mdev = &isys->media_dev;
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: v4l2_device_register\n");
+ 	rval = v4l2_device_register(&isys->adev->dev, &isys->v4l2_dev);
+ 	if (rval < 0) {
+ 		dev_info(&isys->adev->dev, "can't register v4l2 device\n");
+ 		goto out_media_device_unregister;
+ 	}
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: register_subdevices\n");
+ 	rval = isys_register_subdevices(isys);
+ 	if (rval)
+ 		goto out_v4l2_device_unregister;
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: register_ext_subdevs\n");
+ 	isys_register_ext_subdevs(isys);
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: register_subdev_nodes\n");
+ 	rval = v4l2_device_register_subdev_nodes(&isys->v4l2_dev);
+ 	if (rval)
+ 		goto out_isys_unregister_subdevices;
+ 
++	dev_notice(&isys->adev->dev, "SKDBG reg: notifier_init\n");
+ 	rval = isys_notifier_init(isys);
+ 	if (rval)
+ 		goto out_isys_unregister_subdevices;
+@@ -645,10 +652,12 @@
+ 		return 0;
+ 	}
+ 
++	dev_notice(dev, "SKDBG resume: enter, trace_restore\n");
+ 	ipu_trace_restore(dev);
+ 
+ 	cpu_latency_qos_update_request(&isys->pm_qos, ISYS_PM_QOS_VALUE);
+ 
++	dev_notice(dev, "SKDBG resume: start_tsc_sync\n");
+ 	ret = ipu4_buttress_start_tsc_sync(isp);
+ 	if (ret)
+ 		return ret;
+@@ -662,7 +671,9 @@
+ 		isys->short_packet_tracing_count = 0;
+ 		mutex_unlock(&isys->short_packet_tracing_mutex);
+ 	}
++	dev_notice(dev, "SKDBG resume: setup_hw\n");
+ 	isys_setup_hw(isys);
++	dev_notice(dev, "SKDBG resume: done\n");
+ 
+ 	return 0;
+ }
+@@ -996,19 +1007,25 @@
+ 		}
+ 	}
+ 
++	dev_notice(&adev->dev, "SKDBG probe: debugfs\n");
+ 	/* Debug fs failure is not fatal. */
+ 	ipu_isys_init_debugfs(isys);
+ 
++	dev_notice(&adev->dev, "SKDBG probe: trace_init\n");
+ 	ipu_trace_init(adev->isp, isys->pdata->base, &adev->dev,
+ 		       isys_trace_blocks);
+ 
++	dev_notice(&adev->dev, "SKDBG probe: qos+msg buffers\n");
+ 	cpu_latency_qos_add_request(&isys->pm_qos, PM_QOS_DEFAULT_VALUE);
+ 	alloc_fw_msg_buffers(isys, 20);
+ 
++	dev_notice(&adev->dev, "SKDBG probe: pm_runtime_allow/enable\n");
+ 	pm_runtime_allow(&adev->dev);
+ 	pm_runtime_enable(&adev->dev);
+ 
++	dev_notice(&adev->dev, "SKDBG probe: register_devices\n");
+ 	rval = isys_register_devices(isys);
++	dev_notice(&adev->dev, "SKDBG probe: register_devices returned\n");
+ 	if (rval)
+ 		goto out_remove_pkg_dir_shared_buffer;
+ 
+--- a/ipu4/ipu4-isys.c
++++ b/ipu4/ipu4-isys.c
+@@ -275,10 +275,15 @@
+ 
+ void isys_setup_hw(struct ipu_isys *isys)
+ {
++	dev_notice(&isys->adev->dev, "SKDBG hw: irq_cfg\n");
+ 	ipu4p_isys_irq_cfg(isys);
++	dev_notice(&isys->adev->dev, "SKDBG hw: port_cfg\n");
+ 	ipu4p_isys_port_cfg(isys);
++	dev_notice(&isys->adev->dev, "SKDBG hw: bb_cfg\n");
+ 	ipu4p_isys_bb_cfg(isys);
++	dev_notice(&isys->adev->dev, "SKDBG hw: flush_idrain_en\n");
+ 	ipu4p_isys_flush_idrain_en(isys);
++	dev_notice(&isys->adev->dev, "SKDBG hw: done\n");
+ }
+ #endif
+ 

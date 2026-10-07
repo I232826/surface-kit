@@ -1,0 +1,236 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: agc: Proportional control that waits for the sensor
+
+Stepping exposure by a fixed ratio on every frame overshoots: the sensor
+applies new values a few frames late, so several steps pile up before the
+first shows in the image, and the larger steps needed for a reasonable
+convergence time make that worse (visible as brightness pumping).
+
+Compute the factor that brings the histogram MSV to the target in one step
+(clamped to 4x), then hold until the sensor reports the requested exposure
+before measuring again. Within a narrower band around the target nothing
+moves, so the exposure no longer parks at either edge of a wide band.
+The mean alone lets a white surface in a dim room burn out, so lower the
+target as the share of near-clipped pixels grows (1% to 5%), by up to a
+fifth of the range. Replaces the tiered steps.
+
+---
+--- a/src/ipa/simple/algorithms/agc.cpp	2026-10-06 21:53:14.309564103 +0200
++++ b/src/ipa/simple/algorithms/agc.cpp	2026-10-06 21:53:27.681783620 +0200
+@@ -33,15 +33,9 @@
+  */
+ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
+ 
+-/*
+- * This implements the hysteresis for the exposure adjustment.
+- * It is small enough to have the exposure close to the optimal, and is big
+- * enough to prevent the exposure from wobbling around the optimal value.
+- */
+-static constexpr float kExposureSatisfactory = 0.2;
+-
+ Agc::Agc()
+-	: flickerPeriodUs_(0.0)
++	: flickerPeriodUs_(0.0), requestedTotal_(0.0), framesWaited_(0),
++	  framesApplied_(0)
+ {
+ 	/*
+ 	 * Mains-powered lights flicker at twice the mains frequency. Pick the
+@@ -88,69 +82,111 @@
+ 	again = std::clamp(gainBase * total / (lines * line), cfg.againMin, cfg.againMax);
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++int Agc::configure([[maybe_unused]] IPAContext &context,
++		   [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	requestedTotal_ = 0.0;
++	framesWaited_ = 0;
++	framesApplied_ = 0;
++	return 0;
++}
++
++/*
++ * Proportional control in total exposure (time x gain). The MSV of the
++ * 5-bin histogram of linear data is roughly 5 x mean + 0.5, so the factor
++ * that brings the mean to the target is (optimal - 0.5) / (MSV - 0.5).
++ * Apply it in one step (clamped to 4x either way), then wait until the
++ * sensor reports the requested exposure before measuring again: new values
++ * reach the frames a few frames late, and stepping on every frame meanwhile
++ * piles steps up and overshoots. Once in the band around the target nothing
++ * moves, so there is no hunting.
++ *
++ * The mean alone lets a bright surface in a dim room burn out, so the
++ * target is lowered as the share of near-clipped pixels grows, from
++ * kExposureOptimal at kHighlightsLow down to kHighlightsMinTarget at
++ * kHighlightsHigh. A gentle trade: hard limits on the highlights left
++ * scenes with a little white in them far too dark.
++ */
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			 double exposureMSV, double highlights)
+ {
++	static constexpr double kMaxStep = 4.0;
++	static constexpr double kDeadband = 0.12;	/* MSV units, ~5% */
++	static constexpr double kApplied = 0.06;	/* request reached the sensor */
++	static constexpr unsigned int kMaxWait = 8;	/* frames */
+ 	/*
+-	 * Step size depends on how far off the frame is: x2 / x0.5 when very
+-	 * far, 30% / 20% when moderately off, and the original ~10% close to
+-	 * the target. The loop steps from the exposure actually applied to the
+-	 * frame, which lags the request by the sensor's control delay, so with
+-	 * fixed 10% steps a stream starting at minimum exposure in a dim room
+-	 * took 200+ frames (7-8 s) to become usable.
++	 * Frames the request must have been reported applied before measuring:
++	 * one extra covers a sensor whose real control delay is a frame longer
++	 * than libcamera's table says (gain delay 1 vs 2 made this oscillate).
+ 	 */
+-	static constexpr uint8_t kExpDenominator = 10;
+-	const bool veryFar = exposureMSV < 1.5 || exposureMSV > 3.5;
+-	const bool far = exposureMSV < 2.0 || exposureMSV > 3.0;
+-	const uint8_t kExpNumeratorUp = veryFar ? 20 : far ? 13 : 11;
+-	const uint8_t kExpNumeratorDown = veryFar ? 5 : far ? 8 : 9;
++	static constexpr unsigned int kSettle = 2;
++	static constexpr double kHighlightsLow = 0.01;
++	static constexpr double kHighlightsHigh = 0.05;
++	static constexpr double kHighlightsMinTarget = 2.0;
+ 
++	const auto &cfg = context.configuration.agc;
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
++	const double gainBase = std::max(cfg.againMin, cfg.again10);
++	if (gainBase <= 0.0)
++		return;
++
++	const double applied = exposure * again / gainBase;
+ 
+-	if (exposureMSV < kExposureOptimal - kExposureSatisfactory) {
+-		if (exposure < context.configuration.agc.exposureMax) {
+-			int32_t next = exposure * kExpNumeratorUp / kExpDenominator;
+-			if (next - exposure < 1)
+-				exposure += 1;
+-			else
+-				exposure = next;
+-		} else {
+-			double next = again * kExpNumeratorUp / kExpDenominator;
+-			if (next - again < context.configuration.agc.againMinStep)
+-				again += context.configuration.agc.againMinStep;
+-			else
+-				again = next;
++	if (requestedTotal_ > 0.0) {
++		const bool reached = std::abs(applied / requestedTotal_ - 1.0) <= kApplied;
++		framesApplied_ = reached ? framesApplied_ + 1 : 0;
++		if (framesApplied_ < kSettle && framesWaited_ < kMaxWait) {
++			/* Still on its way: keep sending the request, don't measure. */
++			framesWaited_++;
++			exposure = context.activeState.agc.exposure;
++			again = context.activeState.agc.again;
++			return;
+ 		}
+ 	}
++	framesWaited_ = 0;
+ 
+-	if (exposureMSV > kExposureOptimal + kExposureSatisfactory) {
+-		if (again > context.configuration.agc.again10) {
+-			double next = again * kExpNumeratorDown / kExpDenominator;
+-			if (again - next < context.configuration.agc.againMinStep)
+-				again -= context.configuration.agc.againMinStep;
+-			else
+-				again = next;
+-		} else {
+-			int32_t next = exposure * kExpNumeratorDown / kExpDenominator;
+-			if (exposure - next < 1)
+-				exposure -= 1;
+-			else
+-				exposure = next;
+-		}
++	const double hl = std::clamp((highlights - kHighlightsLow) /
++				     (kHighlightsHigh - kHighlightsLow), 0.0, 1.0);
++	const double target = kExposureOptimal -
++			      hl * (kExposureOptimal - kHighlightsMinTarget);
++
++	double factor = std::clamp((target - 0.5) / std::max(exposureMSV - 0.5, 0.01),
++				   1.0 / kMaxStep, kMaxStep);
++	if (std::abs(exposureMSV - target) <= kDeadband)
++		factor = 1.0;
++	if (std::abs(factor - 1.0) < 0.03)
++		factor = 1.0;
++
++	if (factor == 1.0) {
++		requestedTotal_ = applied;
++		framesApplied_ = kSettle;	/* nothing in flight */
++		context.activeState.agc.exposure = exposure;
++		context.activeState.agc.again = again;
++		return;
+ 	}
+ 
+-	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+-			      context.configuration.agc.exposureMax);
+-	again = std::clamp(again, context.configuration.agc.againMin,
+-			   context.configuration.agc.againMax);
++	const double maxTotal = cfg.exposureMax * cfg.againMax / gainBase;
++	const double total = std::clamp(applied * factor,
++					static_cast<double>(cfg.exposureMin), maxTotal);
++
++	/* Exposure time first, gain (from unity) only once time is maxed. */
++	exposure = std::clamp(static_cast<int32_t>(std::lround(std::min(total,
++						static_cast<double>(cfg.exposureMax)))),
++			      cfg.exposureMin, cfg.exposureMax);
++	again = std::clamp(gainBase * total / exposure, cfg.againMin, cfg.againMax);
+ 
+ 	avoidFlicker(context, exposure, again);
+ 
++	requestedTotal_ = exposure * again / gainBase;
++	framesApplied_ = 0;
+ 	context.activeState.agc.exposure = exposure;
+ 	context.activeState.agc.again = again;
+ 
+ 	LOG(IPASoftExposure, Debug)
+-		<< "exposureMSV " << exposureMSV
++		<< "exposureMSV " << exposureMSV << " highlights " << highlights
++		<< " target " << target
++		<< " factor " << factor
+ 		<< " exp " << exposure << " again " << again;
+ }
+ 
+@@ -219,7 +255,15 @@
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++
++	/* Share of pixels in the top 1/16 of the range (Y >= 240). */
++	unsigned int bright = 0;
++	for (unsigned int i = SwIspStats::kYHistogramSize * 15 / 16;
++	     i < SwIspStats::kYHistogramSize; i++)
++		bright += histogram[i];
++	const double highlights = denom ? static_cast<double>(bright) / denom : 0.0;
++
++	updateExposure(context, frameContext, exposureMSV, highlights);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+--- a/src/ipa/simple/algorithms/agc.h	2026-10-06 21:53:14.309699019 +0200
++++ b/src/ipa/simple/algorithms/agc.h	2026-10-06 21:53:14.304854546 +0200
+@@ -19,16 +19,22 @@
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			    double exposureMSV, double highlights);
+ 	void avoidFlicker(IPAContext &context, int32_t &exposure, double &again);
+ 
+ 	double flickerPeriodUs_;
++	/* Total exposure last requested (lines at unity gain), 0 = none */
++	double requestedTotal_;
++	unsigned int framesWaited_;
++	unsigned int framesApplied_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */

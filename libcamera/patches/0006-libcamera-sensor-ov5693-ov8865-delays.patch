@@ -1,0 +1,38 @@
+From: surface-kit
+Subject: [PATCH] libcamera: sensor: Add ov5693 and ov8865 control delays
+
+Both latch exposure and gain two frames after they are written. Without
+an entry the legacy sensor code assumes a one-frame gain delay, which
+made the soft AGC measure frames with the old gain and oscillate.
+
+---
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp	2026-10-06 21:20:12.875673695 +0200
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp	2026-10-06 21:20:12.893365197 +0200
+@@ -425,7 +425,12 @@
+ 				 * Rolling Bar".
+ 				 */
+ 			},
+-			.sensorDelays = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
+ 		} },
+ 		{ "ov64a40", {
+ 			.unitCellSize = { 1008, 1008 },
+@@ -483,7 +488,12 @@
+ 				 * 5: "Color squares with rolling bar"
+ 				 */
+ 			},
+-			.sensorDelays = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
+ 		} },
+ 		{ "ov9281", {
+ 			.unitCellSize = { 3000, 3000 },

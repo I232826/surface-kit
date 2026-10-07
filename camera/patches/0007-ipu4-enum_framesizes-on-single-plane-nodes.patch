@@ -1,0 +1,22 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: implement VIDIOC_ENUM_FRAMESIZES on single-plane nodes
+
+ipu_isys_vidioc_enum_framesizes() only depends on the node's pfmts table,
+but it was only hooked up for multi-plane nodes. The CSI2 BE SOC capture
+node, the one clean raster output and the one libcamera's simple pipeline
+uses, is single-plane, so libcamera got ENOTTY and rejected both sensors:
+
+  /dev/video42[16:cap]: Unable to enumerate frame sizes: Inappropriate ioctl for device
+  SimplePipeline simple.cpp:653 No valid configuration found
+
+---
+--- a/ipu-isys-video.c
++++ b/ipu-isys-video.c
+@@ -2307,6 +2307,7 @@
+ static const struct v4l2_ioctl_ops ioctl_ops_splane = {
+ 	.vidioc_querycap = ipu_isys_vidioc_querycap,
+ 	.vidioc_enum_fmt_vid_cap = ipu_isys_vidioc_enum_fmt,
++	.vidioc_enum_framesizes = ipu_isys_vidioc_enum_framesizes,
+ 	.vidioc_g_fmt_vid_cap = vidioc_g_fmt_vid_cap,
+ 	.vidioc_s_fmt_vid_cap = vidioc_s_fmt_vid_cap,
+ 	.vidioc_try_fmt_vid_cap = vidioc_try_fmt_vid_cap,

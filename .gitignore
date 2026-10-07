@@ -1,0 +1,9 @@
+vendor/
+camera/.build/
+camera/out/
+*.log
+captures/
+sweeps/
+libcamera/.work-*/
+camera/logs/
+__pycache__/

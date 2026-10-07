@@ -1,0 +1,128 @@
+From: surface-kit
+Subject: [PATCH] DEBUG: ipu4 runtime-PM, buttress power and sensor clock breadcrumbs
+
+Temporary. After a clean isys probe and first power-up the machine still
+hard-freezes silently. Log every bus runtime suspend/resume, buttress power
+switch and sensor clock op, and add skdbg_rpm_forbid=1 to keep the isys
+powered so we can tell a power-down hang from anything else.
+
+---
+--- a/ipu-bus.c
++++ b/ipu-bus.c
+@@ -35,6 +35,7 @@
+ 
+ static int bus_pm_runtime_suspend(struct device *dev)
+ {
++	int __skdbg __maybe_unused = (dev_notice(dev, "SKDBG %s\n", __func__), 0);
+ 	struct ipu_bus_device *adev = to_ipu_bus_device(dev);
+ 	int rval;
+ 
+@@ -88,6 +89,7 @@
+ 
+ static int bus_pm_runtime_resume(struct device *dev)
+ {
++	int __skdbg __maybe_unused = (dev_notice(dev, "SKDBG %s\n", __func__), 0);
+ 	struct ipu_bus_device *adev = to_ipu_bus_device(dev);
+ 	int rval;
+ 
+--- a/ipu-buttress.c
++++ b/ipu-buttress.c
+@@ -505,6 +505,7 @@
+ int ipu_buttress_power(struct device *dev,
+ 		       struct ipu_buttress_ctrl *ctrl, bool on)
+ {
++	int __skdbg __maybe_unused = (dev_notice(dev, "SKDBG buttress_power on=%d\n", on), 0);
+ 	struct ipu_device *isp = to_ipu_bus_device(dev)->isp;
+ 	u32 pwr_sts, val;
+ 	int ret = 0;
+@@ -989,6 +990,7 @@
+ 
+ static int ipu_buttress_clk_pll_prepare(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 	int ret;
+ 
+@@ -999,6 +1001,7 @@
+ 
+ static void ipu_buttress_clk_pll_unprepare(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 
+ 	/* Workaround needed to get sensor clock stopped in some cases */
+@@ -1007,6 +1010,7 @@
+ 
+ static int ipu_buttress_clk_pll_enable(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 	u32 val;
+ 	unsigned int i;
+@@ -1036,6 +1040,7 @@
+ 
+ static void ipu_buttress_clk_pll_disable(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 	u32 val;
+ 	int i;
+@@ -1055,6 +1060,7 @@
+ 
+ static int ipu_buttress_clk_enable(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 	u32 val;
+ 
+@@ -1070,6 +1076,7 @@
+ 
+ static void ipu_buttress_clk_disable(struct clk_hw *hw)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s\n", __func__, clk_hw_get_name(hw)), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 	u32 val;
+ 
+@@ -1114,6 +1121,7 @@
+ 				     unsigned long rate,
+ 				     unsigned long parent_rate)
+ {
++	int __skdbg __maybe_unused = (pr_notice("intel-ipu4: SKDBG %s %s %lu\n", __func__, clk_hw_get_name(hw), rate), 0);
+ 	struct clk_ipu_sensor *ck = to_clk_ipu_sensor(hw);
+ 
+ 	/*
+--- a/ipu-isys.c
++++ b/ipu-isys.c
+@@ -73,6 +73,10 @@
+ static bool csi2_port_optimized = true;
+ module_param(csi2_port_optimized, bool, 0660);
+ MODULE_PARM_DESC(csi2_port_optimized, "IPU CSI2 port optimization");
++
++static bool skdbg_rpm_forbid;
++module_param(skdbg_rpm_forbid, bool, 0444);
++MODULE_PARM_DESC(skdbg_rpm_forbid, "DEBUG: keep isys runtime-resumed (never power the island down)");
+ 
+ struct isys_i2c_test {
+ 	u8 bus_nr;
+@@ -680,6 +684,7 @@
+ 
+ static int isys_runtime_pm_suspend(struct device *dev)
+ {
++	int __skdbg __maybe_unused = (dev_notice(dev, "SKDBG %s\n", __func__), 0);
+ 	struct ipu_bus_device *adev = to_ipu_bus_device(dev);
+ 	struct ipu_isys *isys = ipu_bus_get_drvdata(adev);
+ 	unsigned long flags;
+@@ -1020,7 +1025,12 @@
+ 	alloc_fw_msg_buffers(isys, 20);
+ 
+ 	dev_notice(&adev->dev, "SKDBG probe: pm_runtime_allow/enable\n");
+-	pm_runtime_allow(&adev->dev);
++	if (skdbg_rpm_forbid) {
++		dev_notice(&adev->dev, "SKDBG runtime PM forbidden (stays powered)\n");
++		pm_runtime_forbid(&adev->dev);
++	} else {
++		pm_runtime_allow(&adev->dev);
++	}
+ 	pm_runtime_enable(&adev->dev);
+ 
+ 	dev_notice(&adev->dev, "SKDBG probe: register_devices\n");

@@ -1,0 +1,83 @@
+From: surface-kit
+Subject: [PATCH] media: i2c: dw9719: share the sensor's avdd when there is no vdd
+
+On ACPI platforms the VCM is created by ipu-bridge as "<sensor>-VCM" and
+int3472 maps the module's power rail ("avdd") to the sensor only. The VCM
+falls back to a dummy regulator and only answers on I2C while the sensor
+happens to be powered (Surface Pro 7 rear ov8865: "Error writing reg
+0x0003: -121" once the sensor suspends, then runtime PM error).
+
+If no "vdd" is mapped, look up the sensor by name and take a reference on
+its "avdd" regulator, so the rail stays up while either user needs it.
+
+---
+--- a/dw9719.c
++++ b/dw9719.c
+@@ -350,6 +350,58 @@
+ 
+ static const struct v4l2_subdev_ops dw9719_ops = { };
+ 
++static void dw9719_put_regulator(void *reg)
++{
++	regulator_put(reg);
++}
++
++/*
++ * On ACPI platforms ipu-bridge names a sensor's VCM "<sensor>-VCM", and
++ * int3472 maps the camera module's power rail only to the sensor ("avdd").
++ * Without a "vdd" of its own the VCM then sits on a dummy regulator and
++ * stops answering on I2C (-EREMOTEIO) whenever the sensor powers down.
++ * Share the sensor's rail instead; the regulator core refcounts the users.
++ */
++static struct regulator *dw9719_get_regulator(struct device *dev)
++{
++	const char *name = dev_name(dev);
++	size_t len = strlen(name);
++	struct regulator *reg;
++	struct device *sensor;
++	char sensor_name[64];
++	int ret;
++
++	reg = devm_regulator_get_optional(dev, "vdd");
++	if (!IS_ERR(reg) || PTR_ERR(reg) != -ENODEV)
++		return reg;
++
++	if (len > 4 && len - 4 < sizeof(sensor_name) &&
++	    !strcmp(name + len - 4, "-VCM")) {
++		memcpy(sensor_name, name, len - 4);
++		sensor_name[len - 4] = '\0';
++
++		sensor = bus_find_device_by_name(&i2c_bus_type, NULL,
++						 sensor_name);
++		if (sensor) {
++			reg = regulator_get_optional(sensor, "avdd");
++			put_device(sensor);
++			if (!IS_ERR(reg)) {
++				ret = devm_add_action_or_reset(dev,
++							       dw9719_put_regulator,
++							       reg);
++				if (ret)
++					return ERR_PTR(ret);
++				dev_info(dev, "sharing %s avdd as vdd\n",
++					 sensor_name);
++				return reg;
++			}
++		}
++	}
++
++	/* as before: a dummy regulator */
++	return devm_regulator_get(dev, "vdd");
++}
++
+ static int dw9719_probe(struct i2c_client *client)
+ {
+ 	struct dw9719_device *dw9719;
+@@ -367,7 +419,7 @@
+ 
+ 	dw9719->dev = &client->dev;
+ 
+-	dw9719->regulator = devm_regulator_get(&client->dev, "vdd");
++	dw9719->regulator = dw9719_get_regulator(&client->dev);
+ 	if (IS_ERR(dw9719->regulator))
+ 		return dev_err_probe(&client->dev, PTR_ERR(dw9719->regulator),
+ 				     "getting regulator\n");

@@ -1,0 +1,479 @@
+From: surface-kit
+Subject: [PATCH] software_isp: Colour sums scale, highlight shoulder, lens shading
+
+- SwStatsCpu: keep the colour sums on the 8-bit scale of the black level.
+  Unpacked 10/12-bit lines summed raw samples while AWB subtracted the
+  8-bit black level from them, leaving a light dependent colour cast.
+- Highlight shoulder instead of a hard clip after the colour gains (GPU
+  shaders and CPU lookup tables), and in the GPU path pixels where the
+  sensor saturated are blended towards neutral, so whites keep gradation
+  and clipped whites don't turn pink or green.
+- Radial lens shading correction (GPU debayer): 1 + k1 r^2 + k2 r^4 per raw
+  channel, r over half the image width, from a new Lsc tuning algorithm.
+- Surface Pro 7 tuning: the drivers set black level 16 (10-bit), not 64;
+  ov8865 shading fitted on a flat field (corners ~3x darker).
+
+---
+--- c/include/libcamera/internal/software_isp/debayer_params.h	2026-01-29 13:17:26.000000000 +0100
++++ b/include/libcamera/internal/software_isp/debayer_params.h	2026-10-06 22:54:59.691752662 +0200
+@@ -23,6 +23,13 @@
+ 	float gamma;
+ 	float contrastExp;
+ 	RGB<float> gains;
++	/*
++	 * Radial lens shading gain per raw channel, 1 + k1 r^2 + k2 r^4, with r
++	 * the distance from the image centre over half the image width. Only
++	 * the GPU debayer applies it.
++	 */
++	RGB<float> lscK1;
++	RGB<float> lscK2;
+ };
+ 
+ } /* namespace libcamera */
+--- c/src/ipa/simple/algorithms/lsc.cpp	1970-01-01 01:00:00.000000000 +0100
++++ b/src/ipa/simple/algorithms/lsc.cpp	2026-10-06 22:55:11.348560166 +0200
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Radial lens shading correction for the soft IPA
++ */
++
++#include "lsc.h"
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++/**
++ * \class Lsc
++ * \brief Radial lens shading correction from tuning data
++ *
++ * The gain for each raw channel is 1 + k1 r^2 + k2 r^4, with r the distance
++ * from the image centre divided by half the image width, so one set of
++ * coefficients fits every mode that uses the sensor's full width, whether
++ * cropped or binned. The tuning file gives k1 and k2 as [ r, g, b ].
++ */
++
++static RGB<float> readRGB(const YamlObject &data, const char *key)
++{
++	RGB<float> v({ 0.0f, 0.0f, 0.0f });
++	const YamlObject &list = data[key];
++	if (list.isList() && list.size() == 3) {
++		for (unsigned int i = 0; i < 3; i++)
++			v[i] = list[i].get<float>(0.0f);
++	}
++	return v;
++}
++
++int Lsc::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	k1_ = readRGB(tuningData, "k1");
++	k2_ = readRGB(tuningData, "k2");
++
++	LOG(IPASoftLsc, Debug) << "k1 " << k1_ << " k2 " << k2_;
++	return 0;
++}
++
++void Lsc::prepare([[maybe_unused]] IPAContext &context,
++		  [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  DebayerParams *params)
++{
++	params->lscK1 = k1_;
++	params->lscK2 = k2_;
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+--- c/src/ipa/simple/algorithms/lsc.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/ipa/simple/algorithms/lsc.h	2026-10-06 22:55:11.345560176 +0200
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Radial lens shading correction for the soft IPA
++ */
++
++#pragma once
++
++#include "libcamera/internal/vector.h"
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++	~Lsc() = default;
++
++	int init(IPAContext &context, const YamlObject &tuningData) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	RGB<float> k1_;
++	RGB<float> k2_;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+--- c/src/ipa/simple/algorithms/meson.build	2026-10-06 22:04:40.063933366 +0200
++++ b/src/ipa/simple/algorithms/meson.build	2026-10-06 22:54:59.692653269 +0200
+@@ -7,4 +7,5 @@
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'lsc.cpp',
+ ])
+--- c/src/ipa/simple/data/ov5693.yaml	2026-10-06 21:53:29.125040238 +0200
++++ b/src/ipa/simple/data/ov5693.yaml	2026-10-06 23:06:37.468419719 +0200
+@@ -1,13 +1,14 @@
+ # SPDX-License-Identifier: CC0-1.0
+ %YAML 1.1
+ ---
+-# Surface Pro 7. The sensor's black level target is fixed at 64 (10-bit);
+-# without it the soft IPA guesses one from the darkest 2% of the image,
+-# which in scenes without real black skews brightness and colour balance.
++# Surface Pro 7. The driver sets the sensor's black level target to 16
++# (10-bit, register 0x4009; measured 15-16 on a covered lens); without it
++# the soft IPA guesses one from the darkest 2% of the image, which in scenes
++# without real black skews brightness and colour balance.
+ version: 1
+ algorithms:
+   - BlackLevel:
+-      blackLevel: 4096
++      blackLevel: 1024
+   - Awb:
+   - Adjust:
+   - Agc:
+--- c/src/ipa/simple/data/ov8865.yaml	2026-10-06 22:04:40.064024409 +0200
++++ b/src/ipa/simple/data/ov8865.yaml	2026-10-06 23:06:37.468276442 +0200
+@@ -1,15 +1,21 @@
+ # SPDX-License-Identifier: CC0-1.0
+ %YAML 1.1
+ ---
+-# Surface Pro 7. The sensor's black level target is fixed at 64 (10-bit);
+-# without it the soft IPA guesses one from the darkest 2% of the image,
+-# which in scenes without real black skews brightness and colour balance.
++# Surface Pro 7. The driver sets the sensor's black level target to 16
++# (10-bit, register 0x4009; measured 15-16 on a covered lens); without it
++# the soft IPA guesses one from the darkest 2% of the image, which in scenes
++# without real black skews brightness and colour balance.
+ version: 1
+ algorithms:
+   - BlackLevel:
+-      blackLevel: 4096
++      blackLevel: 1024
+   - Awb:
+   - Adjust:
++  # lens shading, fitted on a flat field (camera/scripts/lsc-fit.py):
++  # the corners of the full 4:3 frame are ~3x darker than the centre
++  - Lsc:
++      k1: [ 1.3212, 1.1457, 0.9666 ]
++      k2: [ 0.0331, -0.0020, 0.0495 ]
+   - Agc:
+   # contrast autofocus on the dw9719 VCM
+   - Af:
+--- c/src/ipa/simple/soft_simple.cpp	2026-10-06 22:26:43.607909165 +0200
++++ b/src/ipa/simple/soft_simple.cpp	2026-10-06 22:54:59.692469093 +0200
+@@ -298,6 +298,9 @@
+ void IPASoftSimple::computeParams(const uint32_t frame)
+ {
+ 	context_.activeState.combinedMatrix = Matrix<float, 3, 3>::identity();
++	/* No shading correction unless the Lsc algorithm sets it */
++	params_->lscK1 = RGB<float>({ 0.0f, 0.0f, 0.0f });
++	params_->lscK2 = RGB<float>({ 0.0f, 0.0f, 0.0f });
+ 
+ 	IPAFrameContext &frameContext = context_.frameContexts.get(frame);
+ 	for (auto const &algo : algorithms())
+--- c/src/libcamera/shaders/bayer_1x_packed.frag	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/shaders/bayer_1x_packed.frag	2026-10-06 22:54:59.693206273 +0200
+@@ -69,6 +69,21 @@
+ uniform vec3 blacklevel;
+ uniform float gamma;
+ uniform float contrastExp;
++uniform vec3 lscK1;
++uniform vec3 lscK2;
++uniform float lscInvHalfWidth;
++
++/*
++ * Highlight shoulder: identity below the knee, then an exponential roll-off
++ * towards 1.0 with matching slope, so highlights pushed past full scale by
++ * the colour gains keep some gradation instead of clipping flat.
++ */
++vec3 shoulder(vec3 x)
++{
++    const float knee = 0.75;
++    vec3 over = max(x - knee, 0.0);
++    return min(x, knee) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
++}
+ 
+ float apply_contrast(float value)
+ {
+@@ -227,6 +242,15 @@
+ 
+ 	rgb = rgb - blacklevel;
+ 
++
++	/* Radial lens shading correction, per raw channel */
++
++	vec2 lscD = (textureOut * tex_size - 0.5 * tex_size) * lscInvHalfWidth;
++
++	float lscR2 = dot(lscD, lscD);
++
++	rgb *= 1.0 + lscK1 * lscR2 + lscK2 * lscR2 * lscR2;
++
+ 	/*
+ 	 *   CCM is a 3x3 in the format
+ 	 *
+@@ -275,7 +299,14 @@
+ 	 * Contrast
+ 	 * contrastExp 0..2 contrast to 0..infinity; avoid actual infinity at tan(pi/2)
+ 	 */
+-	rgb = clamp(rgb, 0.0, 1.0);
++	/*
++	 * Where the sensor itself saturated, the channels' ratios are lost:
++	 * blend towards neutral so clipped whites don't turn pink or green.
++	 */
++	float rawPeak = max(max(rin, gin), bin) / max(1.0 - blacklevel.g, 0.5);
++	rgb = mix(rgb, vec3(max(max(rgb.r, rgb.g), rgb.b)),
++	          smoothstep(0.92, 1.0, rawPeak));
++	rgb = clamp(shoulder(rgb), 0.0, 1.0);
+ 	rgb.r = apply_contrast(rgb.r);
+ 	rgb.g = apply_contrast(rgb.g);
+ 	rgb.b = apply_contrast(rgb.b);
+--- c/src/libcamera/shaders/bayer_unpacked.frag	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/shaders/bayer_unpacked.frag	2026-10-06 22:54:59.692877779 +0200
+@@ -28,6 +28,22 @@
+ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
++uniform vec2            tex_size;
++uniform vec3            lscK1;
++uniform vec3            lscK2;
++uniform float           lscInvHalfWidth;
++
++/*
++ * Highlight shoulder: identity below the knee, then an exponential roll-off
++ * towards 1.0 with matching slope, so highlights pushed past full scale by
++ * the colour gains keep some gradation instead of clipping flat.
++ */
++vec3 shoulder(vec3 x)
++{
++    const float knee = 0.75;
++    vec3 over = max(x - knee, 0.0);
++    return min(x, knee) + (1.0 - knee) * (1.0 - exp(-over / (1.0 - knee)));
++}
+ 
+ float apply_contrast(float value)
+ {
+@@ -130,6 +146,11 @@
+ 
+     rgb = rgb - blacklevel;
+ 
++    /* Radial lens shading correction, per raw channel */
++    vec2 lscD = (center.zw - 0.5 * tex_size) * lscInvHalfWidth;
++    float lscR2 = dot(lscD, lscD);
++    rgb *= 1.0 + lscK1 * lscR2 + lscK2 * lscR2 * lscR2;
++
+     /*
+      *   CCM is a 3x3 in the format
+      *
+@@ -177,7 +198,14 @@
+     /*
+      * Contrast
+      */
+-    rgb = clamp(rgb, 0.0, 1.0);
++    /*
++     * Where the sensor itself saturated, the channels' ratios are lost:
++     * blend towards neutral so clipped whites don't turn pink or green.
++     */
++    float rawPeak = max(max(rin, gin), bin) / max(1.0 - blacklevel.g, 0.5);
++    rgb = mix(rgb, vec3(max(max(rgb.r, rgb.g), rgb.b)),
++              smoothstep(0.92, 1.0, rawPeak));
++    rgb = clamp(shoulder(rgb), 0.0, 1.0);
+     rgb.r = apply_contrast(rgb.r);
+     rgb.g = apply_contrast(rgb.g);
+     rgb.b = apply_contrast(rgb.b);
+--- c/src/libcamera/software_isp/debayer_cpu.cpp	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/software_isp/debayer_cpu.cpp	2026-10-06 22:53:28.038239743 +0200
+@@ -12,6 +12,7 @@
+ #include "debayer_cpu.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <stdlib.h>
+ #include <sys/ioctl.h>
+ #include <time.h>
+@@ -780,6 +781,28 @@
+ 		  gammaTable_[blackIndex]);
+ }
+ 
++/*
++ * Map a gained gamma table index through the highlight shoulder: identity
++ * below the knee (as a fraction of the range above black), then an
++ * exponential roll-off towards full scale, so highlights pushed past it by
++ * the colour gains keep some gradation instead of clipping flat.
++ */
++unsigned int DebayerCpu::shoulderIndex(float index, const DebayerParams &params) const
++{
++	static constexpr float kKnee = 0.75f;
++	const float size = gammaTable_.size();
++	const float black = params.blackLevel[1] * size;
++	const float range = size - 1.0f - black;
++	if (range <= 0.0f)
++		return std::clamp(index, 0.0f, size - 1.0f);
++
++	float x = (index - black) / range;
++	if (x > kKnee)
++		x = kKnee + (1.0f - kKnee) * (1.0f - std::exp(-(x - kKnee) / (1.0f - kKnee)));
++
++	return static_cast<unsigned int>(std::clamp(black + x * range, 0.0f, size - 1.0f));
++}
++
+ void DebayerCpu::updateLookupTables(DebayerParams &params)
+ {
+ 	const bool gammaUpdateNeeded =
+@@ -824,10 +847,10 @@
+ 			auto &blue = swapRedBlueGains_ ? red_ : blue_;
+ 			for (unsigned int i = 0; i < kRGBLookupSize; i++) {
+ 				/* Apply gamma after gain! */
+-				const RGB<float> lutGains = (gains * i / div).min(gammaTableSize - 1);
+-				red[i] = gammaTable_[static_cast<unsigned int>(lutGains.r())];
+-				green[i] = gammaTable_[static_cast<unsigned int>(lutGains.g())];
+-				blue[i] = gammaTable_[static_cast<unsigned int>(lutGains.b())];
++				const RGB<float> lutGains = gains * i / div;
++				red[i] = gammaTable_[shoulderIndex(lutGains.r(), params)];
++				green[i] = gammaTable_[shoulderIndex(lutGains.g(), params)];
++				blue[i] = gammaTable_[shoulderIndex(lutGains.b(), params)];
+ 			}
+ 		}
+ 	}
+--- c/src/libcamera/software_isp/debayer_cpu.h	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/software_isp/debayer_cpu.h	2026-10-06 22:53:28.038444908 +0200
+@@ -112,6 +112,7 @@
+ 	void process4(uint32_t frame, const uint8_t *src, uint8_t *dst);
+ 	void updateGammaTable(DebayerParams &params);
+ 	void updateLookupTables(DebayerParams &params);
++	unsigned int shoulderIndex(float index, const DebayerParams &params) const;
+ 
+ 	/* Max. supported Bayer pattern height is 4, debayering this requires 5 lines */
+ 	static constexpr unsigned int kMaxLineBuffers = 5;
+--- c/src/libcamera/software_isp/debayer_egl.cpp	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/software_isp/debayer_egl.cpp	2026-10-06 22:54:59.693347322 +0200
+@@ -104,6 +104,9 @@
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	lscK1UniformDataIn_ = glGetUniformLocation(programId_, "lscK1");
++	lscK2UniformDataIn_ = glGetUniformLocation(programId_, "lscK2");
++	lscInvHalfWidthUniformDataIn_ = glGetUniformLocation(programId_, "lscInvHalfWidth");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -501,6 +504,10 @@
+ 	 * Contrast
+ 	 */
+ 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
++
++	glUniform3f(lscK1UniformDataIn_, params.lscK1[0], params.lscK1[1], params.lscK1[2]);
++	glUniform3f(lscK2UniformDataIn_, params.lscK2[0], params.lscK2[1], params.lscK2[2]);
++	glUniform1f(lscInvHalfWidthUniformDataIn_, 2.0f / width_);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
+ 	return;
+--- c/src/libcamera/software_isp/debayer_egl.h	2026-01-29 13:17:26.000000000 +0100
++++ b/src/libcamera/software_isp/debayer_egl.h	2026-10-06 22:54:59.693629036 +0200
+@@ -109,6 +109,9 @@
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
++	GLint lscK1UniformDataIn_;
++	GLint lscK2UniformDataIn_;
++	GLint lscInvHalfWidthUniformDataIn_;
+ 
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+--- c/src/libcamera/software_isp/swstats_cpu.cpp	2026-10-06 22:03:08.719717997 +0200
++++ b/src/libcamera/software_isp/swstats_cpu.cpp	2026-10-06 22:51:14.393970176 +0200
+@@ -186,10 +186,16 @@
+ 	yVal += b * kBlueYMul;             \
+ 	stats_.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
+ 
+-#define SWSTATS_FINISH_LINE_STATS() \
+-	stats_.sum_.r() += sumR;    \
+-	stats_.sum_.g() += sumG;    \
+-	stats_.sum_.b() += sumB;
++/*
++ * The colour sums are kept on the 8-bit scale the black level and the packed
++ * formats use: unpacked 10/12-bit samples are scaled down by \a div, or AWB
++ * subtracts a quarter (10-bit) of the black level from them and leaves a
++ * light dependent colour cast.
++ */
++#define SWSTATS_FINISH_LINE_STATS(div) \
++	stats_.sum_.r() += sumR / (div); \
++	stats_.sum_.g() += sumG / (div); \
++	stats_.sum_.b() += sumB / (div);
+ 
+ /*
+  * Focus measure for unpacked formats (x counts pixels): green contrast
+@@ -237,7 +243,7 @@
+ 		SWSTATS_ACCUMULATE_AF_STATS()
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ 	SWSTATS_FINISH_AF_STATS()
+ }
+ 
+@@ -266,7 +272,7 @@
+ 		SWSTATS_ACCUMULATE_AF_STATS()
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(4)
+ 	SWSTATS_FINISH_AF_STATS()
+ }
+ 
+@@ -295,7 +301,7 @@
+ 		SWSTATS_ACCUMULATE_AF_STATS()
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(16)
+ 	SWSTATS_FINISH_AF_STATS()
+ }
+ 
+@@ -322,7 +328,7 @@
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[])
+@@ -348,7 +354,7 @@
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 	}
+ 
+-	SWSTATS_FINISH_LINE_STATS()
++	SWSTATS_FINISH_LINE_STATS(1)
+ }
+ 
+ /**

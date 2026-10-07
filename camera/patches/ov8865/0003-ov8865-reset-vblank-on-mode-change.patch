@@ -1,0 +1,19 @@
+ov8865: reset vblank to the mode default on format change
+
+--- a/ov8865.c	2026-10-06 21:19:27.755594400 +0200
++++ b/ov8865.c	2026-10-06 21:19:27.769698521 +0200
+@@ -2767,6 +2767,14 @@
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.vblank, OV8865_TIMING_MIN_VTS,
+ 				 OV8865_TIMING_MAX_VTS - mode->output_size_y,
+ 				 1, mode->vts - mode->output_size_y);
++	/*
++	 * modify_range only moves the default; a vblank left over from another
++	 * mode (e.g. 22 from 3264x2448) would run 3264x1836 at ~40 fps and cap
++	 * the exposure at 25 ms, so start each new active mode at its default.
++	 */
++	if (format->which == V4L2_SUBDEV_FORMAT_ACTIVE && !ret)
++		__v4l2_ctrl_s_ctrl(sensor->ctrls.vblank,
++				   mode->vts - mode->output_size_y);
+ 
+ 	hblank = mode->hts - mode->output_size_x;
+ 	__v4l2_ctrl_modify_range(sensor->ctrls.hblank, hblank, hblank, 1,

@@ -1,0 +1,193 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: relock the sensor link when frames stop mid-stream
+
+verify_stream_start() bounces the sensor until the D-PHY locks, but only
+when a stream starts. On the Surface Pro 7 front ov5693 the link also
+drops mid-stream ("DPHY non-recoverable synchronization error"): no clean
+frame arrives after that, the stop eventually times out, the active queue
+is cleaned up and reset_needed latches, so every later open() fails with
+EIO for as long as any process keeps a node open (PipeWire always does).
+
+Add a per-pipeline delayed work that, while streaming, checks every 500 ms
+that frames_done still advances whenever the firmware holds buffers, and
+reruns verify_stream_start() if it doesn't. It only trylocks the video
+node mutex, so stop_streaming() can cancel it synchronously while holding
+that mutex.
+
+---
+--- a/ipu-isys-queue.c
++++ b/ipu-isys-queue.c
+@@ -5,6 +5,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/workqueue.h>
+ #include <linux/string.h>
+ 
+ #include <media/media-entity.h>
+@@ -673,6 +674,99 @@
+ 	stream_capture_refeed(ip);
+ }
+ 
++/*
++ * Mid-stream D-PHY relock watchdog. The SP7 front ov5693 link can also
++ * lose sync after a good start ("DPHY non-recoverable synchronization
++ * error"); the firmware then delivers no clean frame for the rest of the
++ * stream, and the eventual stop times out and latches reset_needed. While
++ * a stream runs, check every IPU_ISYS_RELOCK_INTERVAL_MS that clean frames
++ * still arrive whenever the firmware holds buffers, and if not, rerun the
++ * stream-start verification, which bounces the sensor until one does.
++ */
++#define IPU_ISYS_RELOCK_INTERVAL_MS	500
++
++static bool pipeline_fw_has_buffers(struct ipu_isys_pipeline *ip)
++{
++	struct ipu_isys_queue *aq;
++	unsigned long flags;
++	bool any = false;
++
++	list_for_each_entry(aq, &ip->queues, node) {
++		spin_lock_irqsave(&aq->lock, flags);
++		any |= !list_empty(&aq->active);
++		spin_unlock_irqrestore(&aq->lock, flags);
++	}
++
++	return any;
++}
++
++static void relock_watchdog(struct work_struct *work)
++{
++	struct ipu_isys_pipeline *ip =
++	    container_of(to_delayed_work(work), struct ipu_isys_pipeline,
++			 relock_work);
++	struct ipu_isys_video *pipe_av =
++	    container_of(ip, struct ipu_isys_video, ip);
++	unsigned int done;
++
++	if (!atomic_read(&ip->relock_enabled))
++		return;
++
++	done = atomic_read(&ip->frames_done);
++	if (done == ip->relock_last_done) {
++		/*
++		 * Never block on the video node lock: stop_streaming holds
++		 * it while cancelling this work. Holding it here also keeps
++		 * the refeeds in verify_stream_start() from racing QBUF.
++		 */
++		if (!mutex_trylock(&pipe_av->mutex)) {
++			schedule_delayed_work(&ip->relock_work,
++					      msecs_to_jiffies(50));
++			return;
++		}
++		if (atomic_read(&ip->relock_enabled) && ip->streaming &&
++		    pipeline_fw_has_buffers(ip) &&
++		    atomic_read(&ip->frames_done) == ip->relock_last_done) {
++			dev_warn(&pipe_av->isys->adev->dev,
++				 "no frames from %s for %u ms mid-stream, relocking\n",
++				 ip->external->entity->name,
++				 IPU_ISYS_RELOCK_INTERVAL_MS);
++			verify_stream_start(ip);
++		}
++		mutex_unlock(&pipe_av->mutex);
++		done = atomic_read(&ip->frames_done);
++	}
++	ip->relock_last_done = done;
++
++	if (atomic_read(&ip->relock_enabled))
++		schedule_delayed_work(&ip->relock_work,
++				      msecs_to_jiffies(IPU_ISYS_RELOCK_INTERVAL_MS));
++}
++
++void ipu_isys_relock_init(struct ipu_isys_pipeline *ip)
++{
++	INIT_DELAYED_WORK(&ip->relock_work, relock_watchdog);
++	atomic_set(&ip->relock_enabled, 0);
++}
++
++/* Caller must not hold a lock relock_watchdog() blocks on (it only trylocks). */
++void ipu_isys_relock_stop(struct ipu_isys_pipeline *ip)
++{
++	atomic_set(&ip->relock_enabled, 0);
++	cancel_delayed_work_sync(&ip->relock_work);
++}
++
++static void relock_start(struct ipu_isys_pipeline *ip)
++{
++	if (!ip->csi2 || !ip->external || ip->interlaced)
++		return;
++
++	ip->relock_last_done = atomic_read(&ip->frames_done);
++	atomic_set(&ip->relock_enabled, 1);
++	schedule_delayed_work(&ip->relock_work,
++			      msecs_to_jiffies(IPU_ISYS_RELOCK_INTERVAL_MS));
++}
++
+ static int ipu_isys_stream_start(struct ipu_isys_pipeline *ip,
+ 				 struct ipu_isys_buffer_list *bl, bool error)
+ {
+@@ -765,6 +859,7 @@
+ 	 * result in observable frames); see the function's comment.
+ 	 */
+ 	verify_stream_start(ip);
++	relock_start(ip);
+ 
+ 	return 0;
+ 
+@@ -1120,6 +1215,8 @@
+ 		mutex_unlock(&av->mutex);
+ 		mutex_lock(&pipe_av->mutex);
+ 	}
++
++	ipu_isys_relock_stop(ip);
+ 
+ 	mutex_lock(&av->isys->stream_mutex);
+ 	if (ip->nr_streaming == ip->nr_queues && ip->streaming)
+--- a/ipu-isys-video.c
++++ b/ipu-isys-video.c
+@@ -2384,6 +2384,7 @@
+ 	init_completion(&av->ip.stream_start_completion);
+ 	init_completion(&av->ip.stream_stop_completion);
+ 	init_completion(&av->ip.capture_ack_completion);
++	ipu_isys_relock_init(&av->ip);
+ 	INIT_LIST_HEAD(&av->ip.queues);
+ 	spin_lock_init(&av->ip.short_packet_queue_lock);
+ 	av->ip.isys = av->isys;
+@@ -2488,6 +2489,7 @@
+ 	if (!av->aq.vbq.ops)
+ 		return;
+ 
++	ipu_isys_relock_stop(&av->ip);
+ 	video_unregister_device(&av->vdev);
+ 	media_entity_cleanup(&av->vdev.entity);
+ 	mutex_destroy(&av->mutex);
+--- a/ipu-isys-video.h
++++ b/ipu-isys-video.h
+@@ -5,6 +5,7 @@
+ #define IPU_ISYS_VIDEO_H
+ 
+ #include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <linux/list.h>
+ #include <linux/videodev2.h>
+ #include <media/media-entity.h>
+@@ -77,6 +78,10 @@
+ 	 * fw never starves while the D-PHY relock bounces run.
+ 	 */
+ 	atomic_t verify_active;
++	/* mid-stream D-PHY relock watchdog, see relock_watchdog() */
++	struct delayed_work relock_work;
++	atomic_t relock_enabled;
++	unsigned int relock_last_done;
+ 	int last_sequence;
+ 	unsigned int seq_index;
+ 	struct sequence_info seq[IPU_ISYS_MAX_PARALLEL_SOF];
+@@ -128,6 +133,9 @@
+ 	struct media_entity_enum entity_enum;
+ 	struct ipu_isys_sub_stream_vc asv[CSI2_BE_SOC_SOURCE_PADS_NUM];
+ };
++
++void ipu_isys_relock_init(struct ipu_isys_pipeline *ip);
++void ipu_isys_relock_stop(struct ipu_isys_pipeline *ip);
+ 
+ #define to_ipu_isys_pipeline(__pipe)				\
+ 	container_of((__pipe), struct ipu_isys_pipeline, pipe)

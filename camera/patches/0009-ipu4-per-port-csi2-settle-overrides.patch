@@ -1,0 +1,76 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: per CSI-2 port settle count overrides
+
+csi2_csettle/csi2_dsettle apply to every receiver. On the Surface Pro 7 the
+front ov5693 (CSI-2 2, 419.2 MHz x2) needs a longer data-lane settle than
+the calculated minimum, but with the same override the rear ov8865 (CSI-2 0,
+360 MHz x4), which is reliable on the calculated value, needed 10-30 sensor
+bounces per stream start. Add csi2_csettle_port[]/csi2_dsettle_port[]
+arrays indexed by CSI-2 port that take precedence over the global values.
+
+---
+--- a/ipu-isys-csi2.c
++++ b/ipu-isys-csi2.c
+@@ -325,6 +325,20 @@
+ module_param(csi2_dsettle, int, 0644);
+ MODULE_PARM_DESC(csi2_dsettle, "Override data-lane settle count (-1 = calc)");
+ 
++/*
++ * Per CSI-2 receiver overrides, taking precedence over the global ones:
++ * the SP7 front (port 2) wants a longer data-lane settle, while the rear
++ * (port 0) is stable on the calculated value and gets flaky with the
++ * front's. E.g. csi2_dsettle_port=-1,-1,880
++ */
++static int csi2_csettle_port[8] = { [0 ... 7] = -1 };
++module_param_array(csi2_csettle_port, int, NULL, 0644);
++MODULE_PARM_DESC(csi2_csettle_port, "Per CSI-2 port clock-lane settle override (-1 = global/calc)");
++
++static int csi2_dsettle_port[8] = { [0 ... 7] = -1 };
++module_param_array(csi2_dsettle_port, int, NULL, 0644);
++MODULE_PARM_DESC(csi2_dsettle_port, "Per CSI-2 port data-lane settle override (-1 = global/calc)");
++
+ static uint32_t calc_timing(s32 a, int32_t b, int64_t link_freq, int32_t accinv)
+ {
+ 	return accinv * a + (accinv * b * (500000000 >> DIV_SHIFT)
+@@ -336,6 +350,7 @@
+ 			  struct ipu_isys_csi2_timing *timing, uint32_t accinv)
+ {
+ 	__s64 link_freq;
++	int csettle, dsettle;
+ 	int rval;
+ 
+ 	rval = ipu_isys_csi2_get_link_freq(csi2, &link_freq);
+@@ -360,15 +375,24 @@
+ 	dev_dbg(&csi2->isys->adev->dev, "dtermen %u\n", timing->dtermen);
+ 	dev_dbg(&csi2->isys->adev->dev, "dsettle %u\n", timing->dsettle);
+ 
+-	if (csi2_csettle >= 0) {
+-		dev_info(&csi2->isys->adev->dev, "csettle override %u -> %d\n",
+-			 timing->csettle, csi2_csettle);
+-		timing->csettle = csi2_csettle;
+-	}
+-	if (csi2_dsettle >= 0) {
+-		dev_info(&csi2->isys->adev->dev, "dsettle override %u -> %d\n",
+-			 timing->dsettle, csi2_dsettle);
+-		timing->dsettle = csi2_dsettle;
++	csettle = csi2_csettle;
++	dsettle = csi2_dsettle;
++	if (csi2->index < ARRAY_SIZE(csi2_csettle_port) &&
++	    csi2_csettle_port[csi2->index] >= 0)
++		csettle = csi2_csettle_port[csi2->index];
++	if (csi2->index < ARRAY_SIZE(csi2_dsettle_port) &&
++	    csi2_dsettle_port[csi2->index] >= 0)
++		dsettle = csi2_dsettle_port[csi2->index];
++
++	if (csettle >= 0) {
++		dev_info(&csi2->isys->adev->dev, "csi2-%u csettle override %u -> %d\n",
++			 csi2->index, timing->csettle, csettle);
++		timing->csettle = csettle;
++	}
++	if (dsettle >= 0) {
++		dev_info(&csi2->isys->adev->dev, "csi2-%u dsettle override %u -> %d\n",
++			 csi2->index, timing->dsettle, dsettle);
++		timing->dsettle = dsettle;
+ 	}
+ 
+ 	return 0;

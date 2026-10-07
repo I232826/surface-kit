@@ -1,0 +1,54 @@
+From: surface-kit
+Subject: [PATCH] DEBUG: breadcrumbs through the isys power-down path
+
+Temporary. With runtime PM forbidden the machine is stable, so the hard
+freeze is on the way down. The MMU's bus suspend force-suspends its isys
+child and then switches the buttress power island off; log each step and
+the power-state handshake result.
+
+---
+--- a/ipu-bus.c
++++ b/ipu-bus.c
+@@ -30,6 +30,7 @@
+ 	if (dev->parent != parent || adev->ctrl)
+ 		return 0;
+ 
++	dev_notice(dev, "SKDBG forced child suspend (parent %s)\n", dev_name(parent));
+ 	return pm_generic_runtime_suspend(dev);
+ }
+ 
+@@ -81,6 +82,7 @@
+ 	if (dev->parent != parent || adev->ctrl)
+ 		return 0;
+ 
++	dev_notice(dev, "SKDBG forced child resume (parent %s)\n", dev_name(parent));
+ 	mutex_lock(&adev->resume_lock);
+ 	r = pm_generic_runtime_resume(dev);
+ 	mutex_unlock(&adev->resume_lock);
+--- a/ipu-buttress.c
++++ b/ipu-buttress.c
+@@ -539,6 +539,7 @@
+ 		dev_err(&isp->pdev->dev,
+ 			"Change power status timeout with 0x%x\n", val);
+ 
++	dev_notice(dev, "SKDBG buttress_power on=%d done ret=%d sts=0x%x\n", on, ret, val);
+ 	ctrl->started = !ret && on;
+ 
+ 	trace_ipu_perf_reg(BUTTRESS_REG_IS_FREQ_CTL,
+--- a/ipu-isys.c
++++ b/ipu-isys.c
+@@ -698,12 +698,14 @@
+ 	isys->power = 0;
+ 	spin_unlock_irqrestore(&isys->power_lock, flags);
+ 
++	dev_notice(dev, "SKDBG suspend: trace_stop\n");
+ 	ipu_trace_stop(dev);
+ 	mutex_lock(&isys->mutex);
+ 	isys->reset_needed = false;
+ 	mutex_unlock(&isys->mutex);
+ 
+ 	cpu_latency_qos_update_request(&isys->pm_qos, PM_QOS_DEFAULT_VALUE);
++	dev_notice(dev, "SKDBG suspend: done\n");
+ 
+ 	return 0;
+ }

@@ -1,0 +1,55 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: allow leaving firmware CSI-2 ports out of the notifier
+
+The isys async notifier waits for every sensor endpoint described in ACPI.
+On the Surface Pro 7 the IR ov7251 on port 6 never probes (i2c -110), so the
+notifier never completes and isys_notifier_complete() never registers the
+subdev nodes of anything bound after the sensors - in particular the rear
+ov8865's dw9719 VCM, which libcamera then can't open ("Lens initialisation
+failed"). Add skip_fw_ports= to leave such endpoints out.
+
+---
+--- a/ipu-isys.c
++++ b/ipu-isys.c
+@@ -508,6 +508,28 @@
+ 	.complete = isys_notifier_complete,
+ };
+ 
++/*
++ * Firmware (ACPI) CSI-2 ports to leave out of the async notifier. A sensor
++ * that never probes (Surface Pro 7: the ov7251 IR camera on port 6 fails
++ * its i2c probe) keeps the notifier from ever completing, and with it the
++ * registration of subdev nodes for anything bound late, such as the rear
++ * sensor's VCM. E.g. skip_fw_ports=6
++ */
++static int skip_fw_ports[8] = { [0 ... 7] = -1 };
++module_param_array(skip_fw_ports, int, NULL, 0444);
++MODULE_PARM_DESC(skip_fw_ports, "Firmware CSI-2 ports to ignore (-1 = none)");
++
++static bool isys_skip_fw_port(unsigned int port)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(skip_fw_ports); i++)
++		if (skip_fw_ports[i] >= 0 && skip_fw_ports[i] == port)
++			return true;
++
++	return false;
++}
++
+ static int isys_notifier_init(struct ipu_isys *isys)
+ {
+ 	struct ipu_device *isp = isys->adev->isp;
+@@ -527,6 +549,12 @@
+ 		if (ret) {
+ 			dev_err(dev, "fwnode endpoint parse failed: %d\n", ret);
+ 			return ret;
++		}
++
++		if (isys_skip_fw_port(vep.base.port)) {
++			dev_info(dev, "skipping endpoint at fw port %u (skip_fw_ports)\n",
++				 vep.base.port);
++			continue;
+ 		}
+ 
+ 		/* Skip endpoints whose port has no physical CSI receiver */

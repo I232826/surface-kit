@@ -1,0 +1,29 @@
+ov8865: invert_hflip parameter (Surface Pro 7 rear is mirrored)
+
+--- a/ov8865.c	2026-10-06 20:29:44.584069875 +0200
++++ b/ov8865.c	2026-10-06 20:29:44.594801505 +0200
+@@ -2190,6 +2190,15 @@
+ 
+ /* Flip */
+ 
++/*
++ * The Surface Pro 7 rear module reads out mirrored relative to what its
++ * ACPI rotation (180) implies, so libcamera's H+V flip for the rotation
++ * leaves the picture upright but mirrored. Invert the horizontal flip.
++ */
++static bool invert_hflip = true;
++module_param(invert_hflip, bool, 0444);
++MODULE_PARM_DESC(invert_hflip, "Invert horizontal flip (default: on, for Surface Pro 7)");
++
+ static int ov8865_flip_vert_configure(struct ov8865_sensor *sensor, bool enable)
+ {
+ 	u8 bits = OV8865_FORMAT1_FLIP_VERT_ISP_EN |
+@@ -2205,7 +2214,7 @@
+ 		  OV8865_FORMAT2_FLIP_HORZ_SENSOR_EN;
+ 
+ 	return ov8865_update_bits(sensor, OV8865_FORMAT2_REG, bits,
+-				  enable ? bits : 0);
++				  enable != invert_hflip ? bits : 0);
+ }
+ 
+ /* Test Pattern */

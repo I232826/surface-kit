@@ -1,0 +1,52 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: don't follow a link csi2 debug taps don't have
+
+The CSI-2 debug capture nodes are left out of the media graph unless
+debug_capture_links=1, but ipu_isys_video_init() still calls their
+try_fmt_vid_mplane (csi2_try_fmt) to pick a default format. csi2_try_fmt
+takes list_first_entry() of the node's links unconditionally; on the empty
+list that is the list head inside struct video_device, so link->source
+and everything derived from it is whatever memory follows. On Ubuntu's
+6.19.8-surface build that is a pointer into kernel text, and
+v4l2_ctrl_g_ctrl() oopses during isys probe:
+
+  Oops: general protection fault, probably for non-canonical address 0x90909090909090c4
+  RIP: v4l2_ctrl_g_ctrl+0x1b/0x60 [videodev]
+   csi2_try_fmt+0x35/0x60 [intel_ipu4p_isys]
+   ipu_isys_csi2_init+0x3ff/0x5d0 [intel_ipu4p_isys]
+   isys_probe+0x572/0xdd0 [intel_ipu4p_isys]
+
+Check for an unlinked node and fall back to the store_csi2_header
+control's default.
+
+---
+--- a/ipu-isys-csi2.c
++++ b/ipu-isys-csi2.c
+@@ -675,12 +675,23 @@
+ csi2_try_fmt(struct ipu_isys_video *av,
+ 	     struct v4l2_pix_format_mplane *mpix)
+ {
+-	struct media_link *link = list_first_entry(&av->vdev.entity.links,
+-						   struct media_link, list);
+-	struct v4l2_subdev *sd =
+-	    media_entity_to_v4l2_subdev(link->source->entity);
++	struct media_link *link;
++	struct v4l2_subdev *sd;
+ 	struct ipu_isys_csi2 *csi2;
+ 
++	/*
++	 * Debug capture taps are left unlinked (debug_capture_links=0) but
++	 * ipu_isys_video_init() still runs try_fmt on them. Taking the first
++	 * entry of the empty links list yields the list head itself, and
++	 * link->source then reads whatever follows it in the video node.
++	 * Use the control's default (store CSI-2 headers) instead.
++	 */
++	if (list_empty(&av->vdev.entity.links))
++		return ipu_isys_video_try_fmt_vid_mplane(av, mpix, 1);
++
++	link = list_first_entry(&av->vdev.entity.links, struct media_link,
++				list);
++	sd = media_entity_to_v4l2_subdev(link->source->entity);
+ 	if (!sd)
+ 		return NULL;
+ 

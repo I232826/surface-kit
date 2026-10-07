@@ -1,0 +1,214 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: build against stock v4l2 headers
+
+The ipu4 port relies on Intel's out-of-tree changes to core v4l2 headers.
+Built as an out-of-tree module for a distro kernel, those changes break
+the ABI with the running v4l2 core:
+
+ - .get_routing inserted into struct v4l2_subdev_pad_ops ahead of
+   .set_routing shifts .set_routing/.enable_streams/.disable_streams. The
+   core then calls ipu_isys_subdev_get_routing() for VIDIOC_SUBDEV_S_ROUTING
+   with set_routing's arguments, and sees our set_routing as enable_streams.
+ - bpp/two_dim added to struct v4l2_mbus_frame_desc_entry don't exist in
+   the structs stock sensor drivers fill.
+
+Drop .get_routing from the ops tables and call it directly for our own
+subdevs, and report embedded-data geometry as unsupported unless the
+patched headers are present (IPU_V4L2_FRAME_DESC_2D). No change in
+behaviour for ov5693/ov8865, which implement neither op.
+
+---
+--- a/ipu-isys-csi2-be-soc.c
++++ b/ipu-isys-csi2-be-soc.c
+@@ -169,7 +169,6 @@
+ 	.set_selection = ipu_isys_csi2_be_soc_set_sel,
+ 	.enum_mbus_code = ipu_isys_subdev_enum_mbus_code,
+ 	.set_routing = ipu_isys_subdev_set_routing,
+-	.get_routing = ipu_isys_subdev_get_routing,
+ };
+ 
+ static struct v4l2_subdev_ops csi2_be_soc_sd_ops = {
+--- a/ipu-isys-csi2.c
++++ b/ipu-isys-csi2.c
+@@ -183,6 +183,32 @@
+ 	return -EINVAL;
+ }
+ 
++/*
++ * Width in bytes / height of an embedded-data frame-desc entry. The 2D
++ * geometry fields only exist with Intel's out-of-tree v4l2 header changes;
++ * against stock headers no sensor can report them.
++ */
++static int ipu_get_embedded_res(struct v4l2_subdev *sd, u32 *width,
++				u32 *height, u32 *code)
++{
++#ifdef IPU_V4L2_FRAME_DESC_2D
++	struct v4l2_mbus_frame_desc_entry entry;
++	int rval;
++
++	rval = ipu_get_frame_desc_entry_by_dt(sd, &entry,
++					       IPU_ISYS_MIPI_CSI2_TYPE_EMBEDDED8);
++	if (rval)
++		return rval;
++
++	*width = entry.two_dim.width * entry.bpp / BITS_PER_BYTE;
++	*height = entry.two_dim.height;
++	*code = entry.pixelcode;
++	return 0;
++#else
++	return -ENOIOCTLCMD;
++#endif
++}
++
+ static void csi2_meta_prepare_firmware_stream_cfg_default(
+ 			struct ipu_isys_video *av,
+ 			struct ipu_fw_isys_stream_cfg_data_abi *cfg)
+@@ -191,7 +217,7 @@
+ 	    to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+ 	struct ipu_isys_queue *aq = &av->aq;
+ 	struct ipu_fw_isys_output_pin_info_abi *pin_info;
+-	struct v4l2_mbus_frame_desc_entry entry;
++	u32 width, height, code;
+ 	int pin = cfg->nof_output_pins++;
+ 	int inpin = cfg->nof_input_pins++;
+ 	int rval;
+@@ -209,16 +235,13 @@
+ 	pin_info->ft = av->pfmt->css_pixelformat;
+ 	pin_info->send_irq = 1;
+ 
+-	rval =
+-	    ipu_get_frame_desc_entry_by_dt(media_entity_to_v4l2_subdev
+-					   (ip->external->entity), &entry,
+-					   IPU_ISYS_MIPI_CSI2_TYPE_EMBEDDED8);
++	rval = ipu_get_embedded_res(media_entity_to_v4l2_subdev
++				    (ip->external->entity), &width, &height,
++				    &code);
+ 	if (!rval) {
+ 		cfg->input_pins[inpin].dt = IPU_ISYS_MIPI_CSI2_TYPE_EMBEDDED8;
+-		cfg->input_pins[inpin].input_res.width =
+-		    entry.two_dim.width * entry.bpp / BITS_PER_BYTE;
+-		cfg->input_pins[inpin].input_res.height =
+-		    entry.two_dim.height;
++		cfg->input_pins[inpin].input_res.width = width;
++		cfg->input_pins[inpin].input_res.height = height;
+ 	}
+ }
+ 
+@@ -489,9 +512,9 @@
+ 		}
+ 	}
+ 
+-	rval =
+-	    v4l2_subdev_call(media_entity_to_v4l2_subdev(link->source->entity),
+-			     pad, get_routing, &routing);
++	rval = ipu_isys_subdev_call_get_routing(
++			media_entity_to_v4l2_subdev(link->source->entity),
++			&routing);
+ 
+ 	if (rval) {
+ 		csi2->remote_streams = 1;
+@@ -531,22 +554,19 @@
+ {
+ 	struct media_pad *pad =
+ 	    media_pad_remote_pad_first(&sd->entity.pads[CSI2_PAD_SINK]);
+-	struct v4l2_mbus_frame_desc_entry entry;
++	u32 width, height, code;
+ 	int rval;
+ 
+ 	if (!pad)
+ 		return -EINVAL;
+ 
+-	rval =
+-	    ipu_get_frame_desc_entry_by_dt(media_entity_to_v4l2_subdev
+-					   (pad->entity), &entry,
+-					   IPU_ISYS_MIPI_CSI2_TYPE_EMBEDDED8);
++	rval = ipu_get_embedded_res(media_entity_to_v4l2_subdev(pad->entity),
++				    &width, &height, &code);
+ 
+ 	if (!rval) {
+-		fmt->format.width =
+-		    entry.two_dim.width * entry.bpp / BITS_PER_BYTE;
+-		fmt->format.height = entry.two_dim.height;
+-		fmt->format.code = entry.pixelcode;
++		fmt->format.width = width;
++		fmt->format.height = height;
++		fmt->format.code = code;
+ 		fmt->format.field = V4L2_FIELD_NONE;
+ 	}
+ 	return rval;
+@@ -591,7 +611,6 @@
+ 	.set_fmt = ipu_isys_csi2_set_fmt,
+ 	.enum_mbus_code = ipu_isys_subdev_enum_mbus_code,
+ 	.set_routing = ipu_isys_subdev_set_routing,
+-	.get_routing = ipu_isys_subdev_get_routing,
+ };
+ 
+ static struct v4l2_subdev_ops csi2_sd_ops = {
+@@ -634,7 +653,7 @@
+ 					    fmt->which);
+ 		struct media_pad *pad = media_pad_remote_pad_first(
+ 			&sd->entity.pads[CSI2_PAD_SINK]);
+-		struct v4l2_mbus_frame_desc_entry entry;
++		u32 width, height, code;
+ 		int rval;
+ 
+ 		if (!pad) {
+@@ -644,16 +663,14 @@
+ 			return;
+ 		}
+ 
+-		rval = ipu_get_frame_desc_entry_by_dt(
++		rval = ipu_get_embedded_res(
+ 				media_entity_to_v4l2_subdev(pad->entity),
+-				&entry,
+-				IPU_ISYS_MIPI_CSI2_TYPE_EMBEDDED8);
++				&width, &height, &code);
+ 
+ 		if (!rval) {
+-			ffmt->width = entry.two_dim.width * entry.bpp
+-			    / BITS_PER_BYTE;
+-			ffmt->height = entry.two_dim.height;
+-			ffmt->code = entry.pixelcode;
++			ffmt->width = width;
++			ffmt->height = height;
++			ffmt->code = code;
+ 			ffmt->field = V4L2_FIELD_NONE;
+ 		}
+ 
+--- a/ipu-isys-subdev.c
++++ b/ipu-isys-subdev.c
+@@ -593,6 +593,23 @@
+ 	return ret;
+ }
+ 
++/*
++ * .get_routing is not part of the stock v4l2_subdev_pad_ops, so it can't sit
++ * in the ops table of a module built against distro kernel headers (it would
++ * shift .set_routing/.enable_streams and the v4l2 core would call the wrong
++ * function). Our subdevs that support routing are the ones whose set_routing
++ * is ipu_isys_subdev_set_routing; everyone else reports it unsupported.
++ */
++int ipu_isys_subdev_call_get_routing(struct v4l2_subdev *sd,
++				     struct v4l2_subdev_routing *route)
++{
++	if (sd->owner != THIS_MODULE || !sd->ops->pad ||
++	    sd->ops->pad->set_routing != ipu_isys_subdev_set_routing)
++		return -ENOIOCTLCMD;
++
++	return ipu_isys_subdev_get_routing(sd, route);
++}
++
+ int ipu_isys_subdev_get_routing(struct v4l2_subdev *sd,
+ 				struct v4l2_subdev_routing *route)
+ {
+--- a/ipu-isys-subdev.h
++++ b/ipu-isys-subdev.h
+@@ -171,6 +171,8 @@
+ 			   struct v4l2_subdev_krouting *route);
+ int ipu_isys_subdev_get_routing(struct v4l2_subdev *sd,
+ 				struct v4l2_subdev_routing *route);
++int ipu_isys_subdev_call_get_routing(struct v4l2_subdev *sd,
++				     struct v4l2_subdev_routing *route);
+ bool ipu_isys_subdev_has_route(struct media_entity *entity,
+ 			       unsigned int pad0, unsigned int pad1, int *stream);
+ #endif /* IPU_ISYS_SUBDEV_H */

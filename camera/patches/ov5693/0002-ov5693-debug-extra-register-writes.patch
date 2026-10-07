@@ -1,0 +1,80 @@
+From: surface-kit
+Subject: [PATCH] DEBUG: ov5693: runtime extra register writes and MIPI timing dump
+
+For tuning the Surface Pro 7 front camera's marginal CSI-2 link from the
+sensor side (clock lane gating, HS/clock timing minimums): a regs= array
+of 0xRRRRVV writes applied after the global table on every power-up, plus
+a dump of the MIPI control/timing registers before and after.
+
+---
+--- a/ov5693.c
++++ b/ov5693.c
+@@ -676,6 +676,59 @@
+ 	return ret;
+ }
+ 
++/*
++ * DEBUG (Surface Pro 7 link bring-up): extra register writes applied after
++ * the global table on every power-up, as 0xRRRRVV (16-bit register, 8-bit
++ * value; 0 entries are skipped), e.g. regs=0x480004 to make the MIPI clock
++ * lane free-running. Takes effect at the next stream start. The MIPI timing
++ * registers are logged before and after so their defaults are visible.
++ */
++static unsigned int regs[16];
++static int nregs;
++module_param_array(regs, uint, &nregs, 0644);
++MODULE_PARM_DESC(regs, "DEBUG: extra register writes after init, as 0xRRRRVV");
++
++static void ov5693_log_mipi_regs(struct ov5693_device *ov5693, const char *tag)
++{
++	static const u16 addr[] = {
++		0x4800, 0x4802, 0x4818, 0x4819, 0x481a, 0x481b, 0x481c,
++		0x481d, 0x481e, 0x481f, 0x4820, 0x4821, 0x4822, 0x4823,
++		0x4824, 0x4825, 0x4826, 0x4827, 0x4828, 0x4829, 0x4837,
++	};
++	char buf[sizeof(addr) / sizeof(addr[0]) * 13];
++	unsigned int i, n = 0;
++	u64 val;
++
++	for (i = 0; i < ARRAY_SIZE(addr); i++) {
++		if (cci_read(ov5693->regmap, CCI_REG8(addr[i]), &val, NULL))
++			val = 0xff;
++		n += scnprintf(buf + n, sizeof(buf) - n, " %04x=%02llx",
++			       addr[i], val);
++	}
++	dev_info(ov5693->dev, "mipi regs %s:%s\n", tag, buf);
++}
++
++static void ov5693_apply_extra_regs(struct ov5693_device *ov5693)
++{
++	int i, ret = 0;
++
++	if (!nregs) {
++		ov5693_log_mipi_regs(ov5693, "defaults");
++		return;
++	}
++
++	ov5693_log_mipi_regs(ov5693, "before extra");
++	for (i = 0; i < nregs && i < ARRAY_SIZE(regs); i++) {
++		if (!regs[i])
++			continue;
++		cci_write(ov5693->regmap, CCI_REG8(regs[i] >> 8),
++			  regs[i] & 0xff, &ret);
++	}
++	if (ret)
++		dev_err(ov5693->dev, "extra regs write error %d\n", ret);
++	ov5693_log_mipi_regs(ov5693, "after extra");
++}
++
+ static int ov5693_sensor_init(struct ov5693_device *ov5693)
+ {
+ 	int ret;
+@@ -691,6 +744,8 @@
+ 	if (ret)
+ 		return dev_err_probe(ov5693->dev, ret,
+ 				     "global settings error\n");
++
++	ov5693_apply_extra_regs(ov5693);
+ 
+ 	ret = ov5693_mode_configure(ov5693);
+ 	if (!ret)

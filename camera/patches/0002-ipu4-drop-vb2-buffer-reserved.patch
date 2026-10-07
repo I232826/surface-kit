@@ -1,0 +1,27 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: don't use vb2_v4l2_buffer.reserved
+
+Intel's tree appends a "reserved" field to struct vb2_v4l2_buffer and the
+isys stashes the CSI-2 index and VC in it. The field doesn't exist in the
+stock struct, and only Intel's patched videobuf2 core ever copied it out to
+user space, so against a stock kernel the stores are dead. Drop them.
+
+---
+--- a/ipu-isys-queue.c
++++ b/ipu-isys-queue.c
+@@ -1296,15 +1296,6 @@
+ 		buf = to_vb2_v4l2_buffer(vb);
+ 		buf->field = V4L2_FIELD_NONE;
+ 
+-		/*
+-		 * Use "reserved" field to pass csi2 index and vc.
+-		 * May need to change to other approach.
+-		 */
+-		buf->reserved &= 0xFFFFFF00;
+-		if (ip->csi2)
+-			buf->reserved |= ip->csi2->index << 4;
+-		buf->reserved |= ip->vc;
+-
+ 		list_del(&ib->head);
+ 		spin_unlock_irqrestore(&aq->lock, flags);
+ 

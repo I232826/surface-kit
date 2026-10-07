@@ -1,0 +1,46 @@
+From: surface-kit
+Subject: [PATCH] libcamera: pipeline: simple: Cancel unconverted output buffers on capture errors
+
+When a capture buffer completes with an error and the software ISP or a
+converter is in use, imageBufferReady() completes the request with its
+user-facing output buffers without converting anything into them. Their
+metadata is left as it was, so they come back to the application as
+successful frames holding the image and timestamp of whatever frame last
+went through that buffer.
+
+On a camera with an intermittently failing CSI-2 link (Surface Pro 7 front
+ov5693 on IPU4) this shows up as the picture jumping back in time every
+few dozen frames, with sensor timestamps going backwards.
+
+Cancel the output buffers before completing them, which also marks the
+request as cancelled, so applications drop the frame.
+
+---
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -40,6 +40,7 @@
+ #include "libcamera/internal/delayed_controls.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/formats.h"
++#include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/global_configuration.h"
+ #include "libcamera/internal/media_device.h"
+ #include "libcamera/internal/pipeline_handler.h"
+@@ -908,8 +909,16 @@
+ 			return;
+ 
+ 		const RequestOutputs &outputs = conversionQueue_.front();
+-		for (auto &[stream, buf] : outputs.outputs)
++		for (auto &[stream, buf] : outputs.outputs) {
++			/*
++			 * The output buffer was never written for this frame and
++			 * still holds the image (and metadata) of whatever frame
++			 * last went through it. Cancel it so applications don't
++			 * display a stale frame as a new one.
++			 */
++			buf->_d()->cancel();
+ 			pipe->completeBuffer(outputs.request, buf);
++		}
+ 		SimpleFrameInfo *info = frameInfo_.find(outputs.request->sequence());
+ 		if (info)
+ 			info->metadataRequired = false;

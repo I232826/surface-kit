@@ -1,0 +1,103 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: agc: Avoid mains light flicker
+
+The soft IPA's AGC moves the exposure time in free ~10% steps, so under
+mains-powered lighting (LED and fluorescent lamps pulse at 100/120 Hz) the
+exposure is rarely a multiple of the light's period and the image flickers
+or shows rolling bands.
+
+After each AGC step, keep the requested total exposure but re-split it so
+the exposure time is a whole number of flicker periods, with analogue gain
+(>= unity) making up the difference. The mains frequency defaults to 50 Hz
+and can be set with LIBCAMERA_SOFTISP_FLICKER_HZ (0 disables).
+
+---
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -7,9 +7,12 @@
+ 
+ #include "agc.h"
+ 
++#include <cmath>
++#include <cstdlib>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include "control_ids.h"
+ 
+@@ -38,7 +41,51 @@
+ static constexpr float kExposureSatisfactory = 0.2;
+ 
+ Agc::Agc()
+-{
++	: flickerPeriodUs_(0.0)
++{
++	/*
++	 * Mains-powered lights flicker at twice the mains frequency. Pick the
++	 * mains frequency with LIBCAMERA_SOFTISP_FLICKER_HZ (50 or 60), 0
++	 * disables flicker avoidance. Defaults to 50 Hz.
++	 */
++	unsigned long hz = 50;
++	const char *env = utils::secure_getenv("LIBCAMERA_SOFTISP_FLICKER_HZ");
++	if (env)
++		hz = std::strtoul(env, nullptr, 10);
++	if (hz)
++		flickerPeriodUs_ = 1e6 / (2.0 * hz);
++}
++
++/*
++ * Keep the total exposure (time x gain) the control loop asked for, but
++ * split it so the exposure time is a whole number of flicker periods
++ * whenever the scene needs at least one. Exposures that aren't a multiple
++ * of the light's period beat against it and show up as flicker or rolling
++ * bands. Unity gain is the baseline, so this only ever trades exposure
++ * time for gain >= 1x; shorter-than-one-period exposures (bright light)
++ * are left alone.
++ */
++void Agc::avoidFlicker(IPAContext &context, int32_t &exposure, double &again)
++{
++	const auto &cfg = context.configuration.agc;
++	const double line = cfg.lineDuration.get<std::micro>();
++	const double gainBase = std::max(cfg.againMin, cfg.again10);
++
++	if (flickerPeriodUs_ <= 0.0 || line <= 0.0 || gainBase <= 0.0)
++		return;
++
++	const double total = exposure * line * again / gainBase;
++	const double maxTime = cfg.exposureMax * line;
++	if (total < flickerPeriodUs_ || maxTime < flickerPeriodUs_)
++		return;
++
++	const double time = std::floor(std::min(total, maxTime) / flickerPeriodUs_) *
++			    flickerPeriodUs_;
++	const int32_t lines = std::clamp(static_cast<int32_t>(std::lround(time / line)),
++					 cfg.exposureMin, cfg.exposureMax);
++
++	exposure = lines;
++	again = std::clamp(gainBase * total / (lines * line), cfg.againMin, cfg.againMax);
+ }
+ 
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+@@ -90,6 +137,8 @@
+ 			      context.configuration.agc.exposureMax);
+ 	again = std::clamp(again, context.configuration.agc.againMin,
+ 			   context.configuration.agc.againMax);
++
++	avoidFlicker(context, exposure, again);
+ 
+ 	context.activeState.agc.exposure = exposure;
+ 	context.activeState.agc.again = again;
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -26,6 +26,9 @@
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void avoidFlicker(IPAContext &context, int32_t &exposure, double &again);
++
++	double flickerPeriodUs_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */

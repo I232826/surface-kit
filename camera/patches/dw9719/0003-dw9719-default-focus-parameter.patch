@@ -1,0 +1,30 @@
+dw9719: default_focus module parameter
+
+--- a/dw9719.c	2026-10-06 20:24:33.999716513 +0200
++++ b/dw9719.c	2026-10-06 20:24:34.011721123 +0200
+@@ -21,6 +21,14 @@
+ 
+ #define DW9719_MAX_FOCUS_POS	1023
+ #define DW9719_CTRL_STEPS	16
++
++/*
++ * libcamera's simple pipeline has no autofocus, so the lens stays wherever
++ * the control starts. Surface Pro 7 rear: sharpest around 256 for 0.5-1 m.
++ */
++static int default_focus = 256;
++module_param(default_focus, int, 0444);
++MODULE_PARM_DESC(default_focus, "Initial focus_absolute (0-1023, default 256)");
+ #define DW9719_CTRL_DELAY_US	1000
+ 
+ #define DW9718S_PD			CCI_REG8(0)
+@@ -332,7 +340,9 @@
+ 
+ 	dw9719->ctrls.focus = v4l2_ctrl_new_std(&dw9719->ctrls.handler, ops,
+ 						V4L2_CID_FOCUS_ABSOLUTE, 0,
+-						DW9719_MAX_FOCUS_POS, 1, 0);
++						DW9719_MAX_FOCUS_POS, 1,
++						clamp(default_focus, 0,
++						      DW9719_MAX_FOCUS_POS));
+ 
+ 	if (dw9719->ctrls.handler.error) {
+ 		dev_err(dw9719->dev, "Error initialising v4l2 ctrls\n");

@@ -1,0 +1,52 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: Tuning files for the Surface Pro 7 sensors
+
+Set the ov8865 and ov5693 black level (64 at 10 bits) instead of letting
+the soft IPA guess it from the darkest pixels.
+
+---
+--- a/src/ipa/simple/data/meson.build	2026-10-06 20:58:40.473001956 +0200
++++ b/src/ipa/simple/data/meson.build	2026-10-06 20:58:40.480437253 +0200
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'ov5693.yaml',
++    'ov8865.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+--- a/src/ipa/simple/data/ov5693.yaml	1970-01-01 01:00:00.000000000 +0100
++++ b/src/ipa/simple/data/ov5693.yaml	2026-10-06 20:58:40.478437260 +0200
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# Surface Pro 7. The sensor's black level target is fixed at 64 (10-bit);
++# without it the soft IPA guesses one from the darkest 2% of the image,
++# which in scenes without real black skews brightness and colour balance.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  - Adjust:
++  - Agc:
++...
+--- a/src/ipa/simple/data/ov8865.yaml	1970-01-01 01:00:00.000000000 +0100
++++ b/src/ipa/simple/data/ov8865.yaml	2026-10-06 20:58:40.475437271 +0200
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# Surface Pro 7. The sensor's black level target is fixed at 64 (10-bit);
++# without it the soft IPA guesses one from the darkest 2% of the image,
++# which in scenes without real black skews brightness and colour balance.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  - Adjust:
++  - Agc:
++...

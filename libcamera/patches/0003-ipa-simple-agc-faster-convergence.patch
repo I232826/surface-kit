@@ -1,0 +1,41 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: agc: Converge faster when far from the target
+
+The soft IPA AGC moves exposure/gain in fixed ~10% steps, computed from the
+values actually applied to each frame. With the sensor's control delay that
+is roughly one step every few frames, so a stream starting at minimum
+exposure in a dim room (Surface Pro 7 rear ov8865 needs ~8x gain) took
+200+ frames, 7-8 seconds, to become usable.
+
+Scale the step with the distance from the target: x2 / x0.5 when the
+exposure MSV is below 1.5 or above 3.5, 30% / 20% below 2.0 or above 3.0,
+and the original ~10% close to the target. Simulated with a two-frame
+control delay this settles in ~57 frames instead of ~231 in a dark scene,
+without oscillating.
+
+---
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -91,12 +91,18 @@
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
+ 	/*
+-	 * kExpDenominator of 10 gives ~10% increment/decrement;
+-	 * kExpDenominator of 5 - about ~20%
++	 * Step size depends on how far off the frame is: x2 / x0.5 when very
++	 * far, 30% / 20% when moderately off, and the original ~10% close to
++	 * the target. The loop steps from the exposure actually applied to the
++	 * frame, which lags the request by the sensor's control delay, so with
++	 * fixed 10% steps a stream starting at minimum exposure in a dim room
++	 * took 200+ frames (7-8 s) to become usable.
+ 	 */
+ 	static constexpr uint8_t kExpDenominator = 10;
+-	static constexpr uint8_t kExpNumeratorUp = kExpDenominator + 1;
+-	static constexpr uint8_t kExpNumeratorDown = kExpDenominator - 1;
++	const bool veryFar = exposureMSV < 1.5 || exposureMSV > 3.5;
++	const bool far = exposureMSV < 2.0 || exposureMSV > 3.0;
++	const uint8_t kExpNumeratorUp = veryFar ? 20 : far ? 13 : 11;
++	const uint8_t kExpNumeratorDown = veryFar ? 5 : far ? 8 : 9;
+ 
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;

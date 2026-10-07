@@ -1,0 +1,37 @@
+From: surface-kit
+Subject: [PATCH] media: i2c: dw9719: restore the i2c_device_id table
+
+The driver only has an OF match table, but on ACPI platforms ipu-bridge
+creates the sensor's VCM as an i2c client named "dw9719" (e.g. the
+Surface Pro 7 rear ov8865 module), which can only bind through an
+i2c_device_id table. Without it the lens never probes and the focus motor
+stays unpowered at its rest position.
+
+---
+--- a/dw9719.c
++++ b/dw9719.c
+@@ -448,6 +448,16 @@
+ };
+ MODULE_DEVICE_TABLE(of, dw9719_of_table);
+ 
++/*
++ * ipu-bridge instantiates the VCM of ACPI-described sensors as a plain
++ * "dw9719" i2c client, which only an i2c_device_id table can match.
++ */
++static const struct i2c_device_id dw9719_id_table[] = {
++	{ "dw9719", DW9719 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, dw9719_id_table);
++
+ static DEFINE_RUNTIME_DEV_PM_OPS(dw9719_pm_ops, dw9719_suspend, dw9719_resume,
+ 				 NULL);
+ 
+@@ -459,6 +469,7 @@
+ 	},
+ 	.probe = dw9719_probe,
+ 	.remove = dw9719_remove,
++	.id_table = dw9719_id_table,
+ };
+ module_i2c_driver(dw9719_i2c_driver);
+ 

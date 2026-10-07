@@ -1,0 +1,57 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4: only s_stream this pipeline's own subdevs
+
+ipu_isys_video_set_streaming() walks the media graph over every enabled link
+and calls s_stream on each subdev it reaches, skipping only the pipeline's
+own external sensor. libcamera's simple pipeline enables the links of every
+camera while probing, so with both Surface Pro 7 cameras registered,
+starting the rear stream also started the front ov5693 and its CSI-2
+receiver, and stopping it stopped the front's (never started) CSI-2:
+
+  WARNING: drivers/media/v4l2-core/v4l2-subdev.c:484 at call_s_stream
+   stop_streaming+0x12c/0x150 [intel_ipu4p_isys]
+
+leaving the rear chain half-active ("Pipe active for ov8865") and every
+following rear stream needing D-PHY relock bounces. Restrict the walk to
+the IPU subdevs recorded in the pipeline (csi2, csi2_be, csi2_be_soc, tpg).
+
+---
+--- a/ipu-isys-video.c
++++ b/ipu-isys-video.c
+@@ -2099,6 +2099,16 @@
+ 	return rval;
+ }
+ 
++static bool ipu_isys_pipeline_owns(struct ipu_isys_pipeline *ip,
++				    struct media_entity *entity)
++{
++	return (ip->csi2 && entity == &ip->csi2->asd.sd.entity) ||
++	       (ip->csi2_be && entity == &ip->csi2_be->asd.sd.entity) ||
++	       (ip->csi2_be_soc &&
++		entity == &ip->csi2_be_soc->asd.sd.entity) ||
++	       (ip->tpg && entity == &ip->tpg->asd.sd.entity);
++}
++
+ int ipu_isys_video_set_streaming(struct ipu_isys_video *av,
+ 				 unsigned int state,
+ 				 struct ipu_isys_buffer_list *bl)
+@@ -2165,6 +2175,19 @@
+ 		/* Non-subdev nodes can be safely ignored here. */
+ 		if (!is_media_entity_v4l2_subdev(entity))
+ 			continue;
++
++		/*
++		 * The walk follows every enabled link, so it also reaches other
++		 * cameras' chains whose links user space left enabled (libcamera
++		 * enables each camera's links while probing). Only touch this
++		 * pipeline's own IPU subdevs; the external sensor is handled
++		 * separately below.
++		 */
++		if (!ipu_isys_pipeline_owns(ip, entity)) {
++			dev_dbg(dev, "set stream: skipping %s (other pipeline)\n",
++				entity->name);
++			continue;
++		}
+ 
+ 		/* Don't start truly external devices quite yet. */
+ 		if (strncmp(sd->name, IPU_ISYS_ENTITY_PREFIX,

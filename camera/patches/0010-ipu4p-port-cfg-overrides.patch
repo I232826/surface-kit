@@ -1,0 +1,52 @@
+From: surface-kit
+Subject: [PATCH] media: intel: ipu4p: make the per-sip port (lane mux) config overridable
+
+Both sips get a hard-coded port config of 0x3895. Its low bits look like the
+IPU6 JSL FB_PORT_CFG "x2x1 + x2x1" layout, while the Surface Pro 7's combo
+sip carries a x1 IR sensor on port 0 and the x2 front sensor on port 1, whose
+link shows persistent packet header/CRC and sync errors. Add legacy_port_cfg
+and combo_port_cfg parameters, applied on every isys resume, so other
+layouts can be tested without rebuilding.
+
+---
+--- a/ipu4/ipu4-isys.c
++++ b/ipu4/ipu4-isys.c
+@@ -261,14 +261,36 @@
+ 	}
+ }
+ 
++/*
++ * Port (lane mux) config per sip, 0x3895 for both in the original code. Its
++ * low 5 bits match the IPU6 JSL CSI2_HUB_GPREG_SIP_FB_PORT_CFG encodings
++ * (0x15 = "x2x1 + x2x1"), but on the Surface Pro 7 the combo sip has the
++ * IR camera x1 on port 0 and the front camera x2 on port 1 ("x1x2" would
++ * be 0x19). Allow overriding per sip, applied on every isys resume, e.g.:
++ *   echo 0x3899 > /sys/module/intel_ipu4p_isys/parameters/combo_port_cfg
++ */
++static int legacy_port_cfg = -1;
++module_param(legacy_port_cfg, int, 0644);
++MODULE_PARM_DESC(legacy_port_cfg, "Override sip0 (legacy) port config (-1 = 0x3895)");
++
++static int combo_port_cfg = -1;
++module_param(combo_port_cfg, int, 0644);
++MODULE_PARM_DESC(combo_port_cfg, "Override sip1 (combo) port config (-1 = 0x3895)");
++
+ static void ipu4p_isys_port_cfg(struct ipu_isys *isys)
+ {
+ 	void __iomem *base = isys->pdata->base;
+ 	void __iomem *isp_base = isys->adev->isp->base;
++	u32 legacy = legacy_port_cfg >= 0 ? legacy_port_cfg : 0x3895;
++	u32 combo = combo_port_cfg >= 0 ? combo_port_cfg : 0x3895;
++
++	if (legacy_port_cfg >= 0 || combo_port_cfg >= 0)
++		dev_info(&isys->adev->dev, "port cfg legacy 0x%x combo 0x%x\n",
++			 legacy, combo);
+ 
+ 	/* Port config */
+-	writel(0x3895, base + IPU_GPOFFSET + 0x14);
+-	writel(0x3895, base + IPU_COMBO_GPOFFSET + 0x14);
++	writel(legacy, base + IPU_GPOFFSET + 0x14);
++	writel(combo, base + IPU_COMBO_GPOFFSET + 0x14);
+ 	writel((0x100 << 1) | (0x100 << 10) | (0x100 << 19), isp_base +
+ 		   BUTTRESS_REG_CSI_BSCAN_EXCLUDE);
+ }

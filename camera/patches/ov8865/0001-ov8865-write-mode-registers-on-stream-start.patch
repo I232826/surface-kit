@@ -1,0 +1,38 @@
+ov8865: write mode registers on stream start
+
+The mode was only programmed from runtime resume; with the dw9719 device
+link holding the sensor powered, format changes never reached it.
+
+--- a/ov8865.c	2026-10-06 19:41:38.709016057 +0200
++++ b/ov8865.c	2026-10-06 19:41:38.723896133 +0200
+@@ -2618,11 +2618,28 @@
+ 	}
+ 
+ 	mutex_lock(&sensor->mutex);
+-	ret = ov8865_sw_standby(sensor, !enable);
++	/*
++	 * Mode registers are otherwise only written on runtime resume. The
++	 * VCM's device link keeps the sensor powered while the lens subdev is
++	 * open, so a format chosen since then would never reach the sensor.
++	 */
++	if (enable) {
++		ret = ov8865_mode_configure(sensor, state->mode,
++					    state->mbus_code);
++		if (!ret)
++			ret = __v4l2_ctrl_handler_setup(&sensor->ctrls.handler);
++		if (!ret)
++			ret = ov8865_sw_standby(sensor, false);
++	} else {
++		ret = ov8865_sw_standby(sensor, true);
++	}
+ 	mutex_unlock(&sensor->mutex);
+ 
+-	if (ret)
++	if (ret) {
++		if (enable)
++			pm_runtime_put(sensor->dev);
+ 		return ret;
++	}
+ 
+ 	state->streaming = !!enable;
+ 

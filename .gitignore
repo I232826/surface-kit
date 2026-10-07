@@ -7,3 +7,4 @@ sweeps/
 libcamera/.work-*/
 camera/logs/
 __pycache__/
+camera/out-known-good-*/

@@ -1,0 +1,268 @@
+ipu4: power the isys per stream, not per open file
+
+PipeWire keeps the video nodes open, so powering the isys and booting its
+firmware in video_open() kept the IPU powered for good and let one failed
+stream (reset_needed, cleared only by a runtime suspend) block every later
+one until PipeWire was restarted. Do it in start_streaming() and undo it in
+stop_streaming(), counted per streaming queue; after a failure suspend
+synchronously so the next stream starts with the latch cleared. The
+isys MMU already skips TLB invalidation while it is powered down, so
+buffer setup before STREAMON is fine.
+
+---
+--- a/ipu-isys-video.c	2026-10-07 14:40:50.588810752 +0200
++++ b/ipu-isys-video.c	2026-10-07 14:40:50.613347235 +0200
+@@ -249,23 +249,21 @@
+ 	{}
+ };
+ 
+-static int video_open(struct file *file)
++/*
++ * Power the isys and start its firmware for a stream, rather than for an
++ * open file: PipeWire keeps the video nodes open all the time, which kept
++ * the IPU powered for good and, after one failed stream, left the
++ * reset_needed latch (cleared only by a runtime suspend) set forever.
++ * Counted per streaming queue in video_opened; the first user boots the
++ * firmware, the last one closes it and lets the isys suspend.
++ */
++int ipu_isys_video_power_get(struct ipu_isys_video *av)
+ {
+-	struct ipu_isys_video *av = video_drvdata(file);
+ 	struct ipu_isys *isys = av->isys;
+ 	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
+ 	struct ipu_device *isp = adev->isp;
++	int retries = 3;
+ 	int rval;
+-    int retries = 3;
+-
+-	mutex_lock(&isys->mutex);
+-
+-	if (isys->reset_needed || isp->flr_done) {
+-		mutex_unlock(&isys->mutex);
+-		dev_warn(&isys->adev->dev, "isys power cycle required\n");
+-		return -EIO;
+-	}
+-	mutex_unlock(&isys->mutex);
+ 
+ 	do {
+ 		rval = ipu_buttress_authenticate(isp);
+@@ -273,12 +271,11 @@
+ 			break;
+ 
+ 		dev_warn(&isys->adev->dev,
+-				 "FW authentication failed, retrying... (%d attempts left)\n",
+-				 retries);
++			 "FW authentication failed, retrying... (%d attempts left)\n",
++			 retries);
+ 
+ 		/* delay between retries to allow hardware to settle */
+ 		usleep_range(1000, 2000);
+-
+ 	} while (retries-- > 0);
+ 
+ 	if (rval) {
+@@ -292,18 +289,21 @@
+ 		return rval;
+ 	}
+ 
+-	rval = v4l2_fh_open(file);
+-	if (rval)
+-		goto out_power_down;
+-
+-    rval = v4l2_pipeline_pm_get(&av->vdev.entity);
+-	if (rval)
+-		goto out_v4l2_fh_release;
+-
+ 	mutex_lock(&isys->mutex);
+ 
++	/*
++	 * Coming up from suspend cleared the latch; it can only still be set
++	 * while another stream keeps the isys powered.
++	 */
++	if (isys->reset_needed || isp->flr_done) {
++		mutex_unlock(&isys->mutex);
++		dev_warn(&isys->adev->dev, "isys power cycle required\n");
++		rval = -EIO;
++		goto out_power_down;
++	}
++
+ 	if (isys->video_opened++) {
+-		/* Already open */
++		/* Already powered and running */
+ 		mutex_unlock(&isys->mutex);
+ 		return 0;
+ 	}
+@@ -329,55 +329,76 @@
+ 		ipu_fw_isys_cleanup(isys);
+ 	}
+ 
+-
+ 	rval = ipu_fw_isys_init(av->isys, num_stream_support);
+-	if (rval < 0)
+-		goto out_lib_init;
++	if (rval < 0) {
++		isys->video_opened--;
++		mutex_unlock(&isys->mutex);
++		goto out_power_down;
++	}
+ 
+ 	mutex_unlock(&isys->mutex);
+ 
+ 	return 0;
+ 
+-out_lib_init:
+-	isys->video_opened--;
+-	mutex_unlock(&isys->mutex);
+-    v4l2_pipeline_pm_put(&av->vdev.entity);
+-
+-out_v4l2_fh_release:
+-	v4l2_fh_release(file);
+ out_power_down:
+ 	pm_runtime_put(&isys->adev->dev);
+ 
+ 	return rval;
+ }
+ 
+-static int video_release(struct file *file)
++void ipu_isys_video_power_put(struct ipu_isys_video *av)
++{
++	struct ipu_isys *isys = av->isys;
++	bool reset_needed;
++
++	mutex_lock(&isys->mutex);
++
++	if (!--isys->video_opened) {
++		ipu_fw_isys_close(isys);
++		if (isys->fwcom)
++			isys->reset_needed = true;
++	}
++	reset_needed = isys->reset_needed;
++
++	mutex_unlock(&isys->mutex);
++
++	/*
++	 * After a failure suspend right away, so the next stream starts on a
++	 * freshly powered isys with the latch cleared.
++	 */
++	if (reset_needed)
++		pm_runtime_put_sync(&isys->adev->dev);
++	else
++		pm_runtime_put(&isys->adev->dev);
++}
++
++static int video_open(struct file *file)
+ {
+ 	struct ipu_isys_video *av = video_drvdata(file);
+-	int ret = 0;
++	int rval;
+ 
+-	vb2_fop_release(file);
++	rval = v4l2_fh_open(file);
++	if (rval)
++		return rval;
+ 
+-	mutex_lock(&av->isys->mutex);
++	/* No sub-device here implements s_power; kept for the use counts. */
++	rval = v4l2_pipeline_pm_get(&av->vdev.entity);
++	if (rval)
++		v4l2_fh_release(file);
+ 
+-	if (!--av->isys->video_opened) {
+-		ipu_fw_isys_close(av->isys);
+-		if (av->isys->fwcom) {
+-			av->isys->reset_needed = true;
+-			ret = -EIO;
+-		}
+-	}
++	return rval;
++}
+ 
+-	mutex_unlock(&av->isys->mutex);
++static int video_release(struct file *file)
++{
++	struct ipu_isys_video *av = video_drvdata(file);
+ 
+-    v4l2_pipeline_pm_put(&av->vdev.entity);
++	/* Stops streaming on this queue if it was, which drops its power. */
++	vb2_fop_release(file);
+ 
+-	if (av->isys->reset_needed)
+-		pm_runtime_put_sync(&av->isys->adev->dev);
+-	else
+-		pm_runtime_put(&av->isys->adev->dev);
++	v4l2_pipeline_pm_put(&av->vdev.entity);
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ const struct ipu_isys_pixelformat *
+--- a/ipu-isys-video.h	2026-10-07 14:40:50.591539905 +0200
++++ b/ipu-isys-video.h	2026-10-07 14:40:50.613470260 +0200
+@@ -225,6 +225,8 @@
+ void ipu_isys_prepare_firmware_stream_cfg_default(
+ 	struct ipu_isys_video *av,
+ 	struct ipu_fw_isys_stream_cfg_data_abi *cfg);
++int ipu_isys_video_power_get(struct ipu_isys_video *av);
++void ipu_isys_video_power_put(struct ipu_isys_video *av);
+ int ipu_isys_video_prepare_streaming(struct ipu_isys_video *av,
+ 				     unsigned int state);
+ int ipu_isys_video_set_streaming(struct ipu_isys_video *av, unsigned int state,
+--- a/ipu-isys-queue.c	2026-10-07 14:40:50.593782368 +0200
++++ b/ipu-isys-queue.c	2026-10-07 14:40:50.613706799 +0200
+@@ -1111,7 +1111,7 @@
+ 	}
+ }
+ 
+-static int start_streaming(struct vb2_queue *q, unsigned int count)
++static int __start_streaming(struct vb2_queue *q, unsigned int count)
+ {
+ 	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+ 	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+@@ -1202,6 +1202,26 @@
+ 	return rval;
+ }
+ 
++static int start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
++	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
++	int rval;
++
++	/* Each streaming queue holds the isys powered until stop_streaming */
++	rval = ipu_isys_video_power_get(av);
++	if (rval) {
++		return_buffers(aq, VB2_BUF_STATE_QUEUED);
++		return rval;
++	}
++
++	rval = __start_streaming(q, count);
++	if (rval)
++		ipu_isys_video_power_put(av);
++
++	return rval;
++}
++
+ static void stop_streaming(struct vb2_queue *q)
+ {
+ 	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+@@ -1235,6 +1255,8 @@
+ 	}
+ 
+ 	return_buffers(aq, VB2_BUF_STATE_ERROR);
++
++	ipu_isys_video_power_put(av);
+ }
+ 
+ static unsigned int
+--- a/ipu-isys.h	2026-10-07 14:40:50.596211980 +0200
++++ b/ipu-isys.h	2026-10-07 14:40:50.613527927 +0200
+@@ -85,7 +85,7 @@
+  *         or optional external library private pointer
+  * @line_align: line alignment in memory
+  * @reset_needed: Isys requires d0i0->i3 transition
+- * @video_opened: total number of opened file handles on video nodes
++ * @video_opened: number of streaming queues holding the isys powered
+  * @mutex: serialise access isys video open/release related operations
+  * @stream_mutex: serialise stream start and stop, queueing requests
+  * @lib_mutex: optional external library mutex

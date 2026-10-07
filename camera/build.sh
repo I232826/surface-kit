@@ -32,7 +32,11 @@ done
 rm -rf "$BUILD"
 mkdir -p "$BUILD"
 cp -r "$VENDOR/pci/intel" "$BUILD/intel"
-for p in "$CAM"/patches/[0-9]*.patch; do
+# DEBUG=1 adds the breadcrumb patches in patches/debug/ (load-time freeze
+# hunting), applied in numeric order among the others.
+PATCHES=("$CAM"/patches/[0-9]*.patch)
+[ -n "${DEBUG:-}" ] && PATCHES+=("$CAM"/patches/debug/[0-9]*.patch)
+for p in $(printf '%s\n' "${PATCHES[@]}" | awk -F/ '{print $NF"\t"$0}' | sort | cut -f2); do
     echo ">> applying $(basename "$p")"
     patch -d "$BUILD/intel" -p1 --forward --quiet < "$p"
 done

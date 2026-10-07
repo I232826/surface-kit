@@ -6,7 +6,7 @@
 #   sudo ~/surface-kit/camera/scripts/debug-isys.sh        # normal runtime PM
 #   sudo ~/surface-kit/camera/scripts/debug-isys.sh pin    # keep the IPU powered
 #
-# Needs a build with patches/0003-DEBUG-isys-probe-breadcrumbs.patch.
+# Needs a debug build: DEBUG=1 camera/build.sh (patches/debug/*).
 set -euo pipefail
 
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
@@ -19,7 +19,7 @@ MODE="${1:-normal}"
 ISYS_ARGS=()
 
 grep -q '^intel_ipu4p ' /proc/modules && { echo "already loaded this boot; reboot first" >&2; exit 1; }
-grep -qa skdbg_rpm_forbid "$OUT/intel-ipu4p-isys.ko" || { echo "isys.ko has no breadcrumbs: run camera/build.sh first" >&2; exit 1; }
+grep -qa skdbg_rpm_forbid "$OUT/intel-ipu4p-isys.ko" || { echo "isys.ko has no breadcrumbs: run DEBUG=1 camera/build.sh first" >&2; exit 1; }
 
 say() { echo; echo ">>> $*"; sleep 1; }
 

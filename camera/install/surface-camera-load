@@ -1,0 +1,60 @@
+#!/bin/bash
+# Boot-time loader for the Surface Pro 7 cameras (IPU4P), run by
+# surface-camera.service. The modules live in /lib/modules/<kver>/updates/
+# surface-kit and take their options from /etc/modprobe.d/surface-kit.conf
+# (both put there by camera/install/install.sh).
+#
+# The IPU modules are blacklisted from auto-loading: they must only load
+# after the IOMMU change below, or the machine freezes hard.
+set -euo pipefail
+
+KVER="$(uname -r)"
+MODDIR="/lib/modules/$KVER/updates/surface-kit"
+MMU1=/sys/bus/intel-ipu4-bus/devices/intel-ipu4-mmu1/power/control
+
+log() { echo "surface-camera: $*"; }
+
+if [ ! -e "$MODDIR/intel-ipu4p-isys.ko" ]; then
+    log "no camera modules for kernel $KVER (rebuild: camera/build.sh, then install.sh); skipping"
+    exit 0
+fi
+if grep -q '^intel_ipu4p ' /proc/modules; then
+    log "already loaded"
+    exit 0
+fi
+
+# The IPU4P only works with its IOMMU group in passthrough (identity) mode:
+# with DMA translation on, its firmware's accesses fault. This gives the IPU
+# unrestricted DMA to memory, like having no IOMMU for this one device.
+echo identity > /sys/kernel/iommu_groups/0/type
+
+# Sensors and lens. ov5693/ov8865 load at boot from ACPI; reload them so the
+# patched copies in updates/ are used even if the stock ones won the race.
+# dw9719 (rear focus motor) must be bound before the isys, or the lens gets
+# no device node. The lens holds a link to ov8865, so it goes out first.
+for m in dw9719 ov8865 ov5693; do
+    if grep -q "^$m " /proc/modules; then
+        modprobe -r "$m"
+    fi
+done
+modprobe -a ov5693 ov8865 dw9719
+
+modprobe -a intel-ipu4p-isys-csslib intel-ipu4p-psys-csslib
+modprobe intel-ipu4p
+modprobe intel-ipu4p-psys
+sleep 2
+
+# Keep the MMU island powered while the isys probes (powering it down
+# mid-probe hung the machine), and keep udev from opening the new nodes
+# until probing is done.
+echo on > "$MMU1"
+udevadm control --stop-exec-queue
+trap 'udevadm control --start-exec-queue' EXIT
+modprobe intel-ipu4p-isys
+sleep 3
+echo auto > "$MMU1"
+udevadm control --start-exec-queue
+trap - EXIT
+udevadm settle --timeout=30 || true
+
+log "loaded: $(ls /dev/media* 2>/dev/null | paste -sd' ')"

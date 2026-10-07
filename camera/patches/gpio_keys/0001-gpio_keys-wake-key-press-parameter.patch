@@ -1,0 +1,32 @@
+gpio_keys: wake_key_press parameter
+
+Lets the Surface power button wake the system without GNOME seeing a press
+and suspending it again right away.
+
+--- a/gpio_keys.c	2026-10-07 14:11:32.773246518 +0200
++++ b/gpio_keys.c	2026-10-07 14:11:32.784959025 +0200
+@@ -30,6 +30,15 @@
+ #include <linux/spinlock.h>
+ #include <dt-bindings/input/gpio-keys.h>
+ 
++/*
++ * A key that wakes the system reports a press even if it was released before
++ * the handler ran. Desktops that put the system to sleep on that key (GNOME
++ * with the Surface power button) then suspend again right after waking.
++ */
++static bool wake_key_press = true;
++module_param(wake_key_press, bool, 0644);
++MODULE_PARM_DESC(wake_key_press, "Report a press for the key that woke the system (default: true)");
++
+ struct gpio_button_data {
+ 	const struct gpio_keys_button *button;
+ 	struct input_dev *input;
+@@ -418,7 +427,7 @@
+ 		const struct gpio_keys_button *button = bdata->button;
+ 
+ 		pm_stay_awake(bdata->input->dev.parent);
+-		if (bdata->suspended  &&
++		if (bdata->suspended && wake_key_press &&
+ 		    (button->type == 0 || button->type == EV_KEY)) {
+ 			/*
+ 			 * Simulate wakeup key press in case the key has

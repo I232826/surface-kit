@@ -17,7 +17,8 @@ KVER="${KVER:-$(uname -r)}"
 KDIR="/lib/modules/$KVER/build"
 CAM="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$CAM")"
-VENDOR="$ROOT/vendor/linux-6.19.8/drivers/media"
+KSRC="$ROOT/vendor/linux-6.19.8/drivers"
+VENDOR="$KSRC/media"
 BUILD="$CAM/.build"
 OUT="$CAM/out/$KVER"
 JOBS="$(nproc)"
@@ -57,13 +58,16 @@ make -C "$KDIR" M="$BUILD/intel" srcpath="$BUILD/intel" \
     "${IPU_VARS[@]}" KCFLAGS="$IPU_KCFLAGS" \
     KBUILD_MODPOST_WARN=1 -j"$JOBS" modules
 
-# Patched in-tree i2c drivers (sensor, lens), each built alone from a scratch
-# Kbuild dir so we don't build all of media/i2c; patches in patches/<name>/.
-I2C_MODS=(ov5693 ov8865 dw9719)
-for m in "${I2C_MODS[@]}"; do
+# Patched single-file in-tree drivers (sensors, lens, and gpio-keys for the
+# power button), each built alone from a scratch Kbuild dir so we don't build
+# whole subsystems; paths are under drivers/, patches in patches/<name>/.
+SINGLE_MODS=(media/i2c/ov5693 media/i2c/ov8865 media/i2c/dw9719
+             input/keyboard/gpio_keys)
+for src in "${SINGLE_MODS[@]}"; do
+    m="$(basename "$src")"
     echo ">> $m"
     mkdir -p "$BUILD/$m"
-    cp "$VENDOR/i2c/$m.c" "$BUILD/$m/"
+    cp "$KSRC/$src.c" "$BUILD/$m/"
     for p in "$CAM"/patches/"$m"/*.patch; do
         [ -e "$p" ] || continue
         echo ">> applying $m/$(basename "$p")"
@@ -76,7 +80,8 @@ done
 rm -rf "$OUT"
 mkdir -p "$OUT"
 find "$BUILD/intel" -name '*.ko' -exec cp {} "$OUT/" \;
-for m in "${I2C_MODS[@]}"; do
+for src in "${SINGLE_MODS[@]}"; do
+    m="$(basename "$src")"
     cp "$BUILD/$m/$m.ko" "$OUT/"
 done
 echo ">> built:"

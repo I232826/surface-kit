@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface Pro 7 cameras (IPU4P)
+Documentation=file:///home/lukas/surface-kit/camera/install/README.md
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/surface-camera-load
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

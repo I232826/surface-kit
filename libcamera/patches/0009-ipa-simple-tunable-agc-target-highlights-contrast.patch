@@ -1,0 +1,190 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: Tunable AGC target and highlights, contrast default
+
+The AGC target, the highlight level and the range over which highlights
+lower the target, and the default contrast become tuning file keys
+(Agc: target, highlightsLevel, highlightsLow, highlightsHigh,
+highlightsMinTarget; Adjust: contrast). The defaults keep the previous
+behaviour. ov8865: target 2.2 and earlier highlight protection, chosen by
+comparing variants on a white object in a dark scene.
+
+---
+--- d/src/ipa/simple/algorithms/adjust.cpp	2026-01-29 13:17:26.000000000 +0100
++++ b/src/ipa/simple/algorithms/adjust.cpp	2026-10-07 14:00:10.455915112 +0200
+@@ -24,12 +24,15 @@
+ 
+ LOG_DEFINE_CATEGORY(IPASoftAdjust)
+ 
+-int Adjust::init(IPAContext &context, [[maybe_unused]] const YamlObject &tuningData)
++int Adjust::init(IPAContext &context, const YamlObject &tuningData)
+ {
++	/* contrast: default when the application sets none (0..2, 1 = linear) */
++	defaultContrast_ = tuningData["contrast"].get<float>(kDefaultContrast);
++
+ 	context.ctrlMap[&controls::Gamma] =
+ 		ControlInfo(0.1f, 10.0f, kDefaultGamma);
+ 	context.ctrlMap[&controls::Contrast] =
+-		ControlInfo(0.0f, 2.0f, kDefaultContrast);
++		ControlInfo(0.0f, 2.0f, defaultContrast_);
+ 	if (context.ccmEnabled)
+ 		context.ctrlMap[&controls::Saturation] =
+ 			ControlInfo(0.0f, 2.0f, kDefaultSaturation);
+@@ -107,7 +110,7 @@
+ 	}
+ 
+ 	params->gamma = 1.0 / context.activeState.knobs.gamma;
+-	const float contrast = context.activeState.knobs.contrast.value_or(kDefaultContrast);
++	const float contrast = context.activeState.knobs.contrast.value_or(defaultContrast_);
+ 	params->contrastExp = tan(std::clamp(contrast * M_PI_4, 0.0, M_PI_2 - 0.00001));
+ }
+ 
+@@ -121,7 +124,7 @@
+ 	metadata.set(controls::Gamma, gamma);
+ 
+ 	const auto &contrast = frameContext.contrast;
+-	metadata.set(controls::Contrast, contrast.value_or(kDefaultContrast));
++	metadata.set(controls::Contrast, contrast.value_or(defaultContrast_));
+ 
+ 	const auto &saturation = frameContext.saturation;
+ 	metadata.set(controls::Saturation, saturation.value_or(kDefaultSaturation));
+--- d/src/ipa/simple/algorithms/adjust.h	2026-01-29 13:17:26.000000000 +0100
++++ b/src/ipa/simple/algorithms/adjust.h	2026-10-07 14:00:10.456024750 +0200
+@@ -43,6 +43,8 @@
+ 
+ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
++
++	float defaultContrast_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+--- d/src/ipa/simple/algorithms/agc.cpp	2026-10-06 21:53:29.106390917 +0200
++++ b/src/ipa/simple/algorithms/agc.cpp	2026-10-07 14:00:10.455791985 +0200
+@@ -15,6 +15,7 @@
+ #include <libcamera/base/utils.h>
+ 
+ #include "control_ids.h"
++#include "libcamera/internal/yaml_parser.h"
+ 
+ namespace libcamera {
+ 
+@@ -82,6 +83,30 @@
+ 	again = std::clamp(gainBase * total / (lines * line), cfg.againMin, cfg.againMax);
+ }
+ 
++/*
++ * Tuning keys, all optional:
++ *   target: mean sample value to aim for (1..5, default 2.5)
++ *   highlightsLevel: Y (0..255) from which a pixel counts as a highlight
++ *   highlightsLow, highlightsHigh: share of highlight pixels over which the
++ *     target is lowered linearly ...
++ *   highlightsMinTarget: ... down to this
++ */
++int Agc::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	target_ = tuningData["target"].get<double>(kExposureOptimal);
++	highlightsLow_ = tuningData["highlightsLow"].get<double>(0.01);
++	highlightsHigh_ = tuningData["highlightsHigh"].get<double>(0.05);
++	highlightsMinTarget_ = tuningData["highlightsMinTarget"].get<double>(2.0);
++	const unsigned int level =
++		std::clamp(tuningData["highlightsLevel"].get<unsigned int>(240), 0u, 255u);
++	highlightsBin_ = level * SwIspStats::kYHistogramSize / 256;
++
++	if (highlightsHigh_ <= highlightsLow_)
++		highlightsHigh_ = highlightsLow_ + 0.01;
++
++	return 0;
++}
++
+ int Agc::configure([[maybe_unused]] IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+@@ -103,8 +128,8 @@
+  *
+  * The mean alone lets a bright surface in a dim room burn out, so the
+  * target is lowered as the share of near-clipped pixels grows, from
+- * kExposureOptimal at kHighlightsLow down to kHighlightsMinTarget at
+- * kHighlightsHigh. A gentle trade: hard limits on the highlights left
++ * target_ at highlightsLow_ down to highlightsMinTarget_ at
++ * highlightsHigh_ (see init() for the tuning keys). A gentle trade: hard limits on the highlights left
+  * scenes with a little white in them far too dark.
+  */
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+@@ -120,9 +145,6 @@
+ 	 * than libcamera's table says (gain delay 1 vs 2 made this oscillate).
+ 	 */
+ 	static constexpr unsigned int kSettle = 2;
+-	static constexpr double kHighlightsLow = 0.01;
+-	static constexpr double kHighlightsHigh = 0.05;
+-	static constexpr double kHighlightsMinTarget = 2.0;
+ 
+ 	const auto &cfg = context.configuration.agc;
+ 	int32_t &exposure = frameContext.sensor.exposure;
+@@ -146,10 +168,9 @@
+ 	}
+ 	framesWaited_ = 0;
+ 
+-	const double hl = std::clamp((highlights - kHighlightsLow) /
+-				     (kHighlightsHigh - kHighlightsLow), 0.0, 1.0);
+-	const double target = kExposureOptimal -
+-			      hl * (kExposureOptimal - kHighlightsMinTarget);
++	const double hl = std::clamp((highlights - highlightsLow_) /
++				     (highlightsHigh_ - highlightsLow_), 0.0, 1.0);
++	const double target = target_ - hl * std::max(target_ - highlightsMinTarget_, 0.0);
+ 
+ 	double factor = std::clamp((target - 0.5) / std::max(exposureMSV - 0.5, 0.01),
+ 				   1.0 / kMaxStep, kMaxStep);
+@@ -256,9 +277,9 @@
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+ 
+-	/* Share of pixels in the top 1/16 of the range (Y >= 240). */
++	/* Share of pixels at or above the highlight level */
+ 	unsigned int bright = 0;
+-	for (unsigned int i = SwIspStats::kYHistogramSize * 15 / 16;
++	for (unsigned int i = highlightsBin_;
+ 	     i < SwIspStats::kYHistogramSize; i++)
+ 		bright += histogram[i];
+ 	const double highlights = denom ? static_cast<double>(bright) / denom : 0.0;
+--- d/src/ipa/simple/algorithms/agc.h	2026-10-06 21:53:29.106584102 +0200
++++ b/src/ipa/simple/algorithms/agc.h	2026-10-07 14:00:10.455056857 +0200
+@@ -19,6 +19,7 @@
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const YamlObject &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+@@ -31,6 +32,13 @@
+ 	void avoidFlicker(IPAContext &context, int32_t &exposure, double &again);
+ 
+ 	double flickerPeriodUs_;
++
++	/* Tuning: exposure target and highlight protection (MSV units) */
++	double target_;
++	double highlightsLow_;
++	double highlightsHigh_;
++	double highlightsMinTarget_;
++	unsigned int highlightsBin_;
+ 	/* Total exposure last requested (lines at unity gain), 0 = none */
+ 	double requestedTotal_;
+ 	unsigned int framesWaited_;
+--- d/src/ipa/simple/data/ov8865.yaml	2026-10-06 23:06:37.468276442 +0200
++++ b/src/ipa/simple/data/ov8865.yaml	2026-10-07 14:06:02.214085960 +0200
+@@ -16,7 +16,15 @@
+   - Lsc:
+       k1: [ 1.3212, 1.1457, 0.9666 ]
+       k2: [ 0.0331, -0.0020, 0.0495 ]
++  # Picked by comparing variants on a white object in a dark scene: a
++  # lower target than the default 2.5 and highlight protection that acts
++  # earlier keep whites readable; a contrast curve made them glow again.
+   - Agc:
++      target: 2.2
++      highlightsLevel: 224
++      highlightsLow: 0.005
++      highlightsHigh: 0.03
++      highlightsMinTarget: 1.9
+   # contrast autofocus on the dw9719 VCM
+   - Af:
+ ...

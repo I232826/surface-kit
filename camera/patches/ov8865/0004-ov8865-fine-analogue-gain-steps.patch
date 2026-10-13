@@ -1,0 +1,19 @@
+ov8865: analogue gain in 1/128 steps instead of whole multiples
+
+--- a/ov8865.c
++++ b/ov8865.c
+@@ -2538,7 +2538,13 @@
+ 
+ 	/* Gain */
+ 
+-	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2048, 128,
++	/*
++	 * Real gain in 1/128 steps (0x3508/0x3509, 0x80 = 1x). A step of 128
++	 * made the control framework round every request to a whole multiple
++	 * of 1x: auto exposure asking for 1.49x got 1x and 1.50x got 2x, and
++	 * the image jumped between them.
++	 */
++	v4l2_ctrl_new_std(handler, ops, V4L2_CID_ANALOGUE_GAIN, 128, 2048, 1,
+ 			  128);
+ 
+ 	/* White Balance */

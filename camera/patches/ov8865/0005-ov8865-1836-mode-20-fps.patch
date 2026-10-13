@@ -1,0 +1,18 @@
+ov8865: 3264x1836 at 20 fps instead of 15 (blanking of the full mode)
+
+--- a/ov8865.c
++++ b/ov8865.c
+@@ -1019,7 +1019,12 @@
+ 
+ 		/* Vertical */
+ 		.output_size_y			= 1836,
+-		.vts				= 2470,
++		/*
++		 * 2470 is the 3264x2448 mode's frame length: 634 idle lines,
++		 * 15 fps. 1862 keeps the same line rate (and link load) with
++		 * the blanking of the full mode: 19.9 fps.
++		 */
++		.vts				= 1862,
+ 
+ 		.size_auto			= true,
+ 		.size_auto_boundary_x		= 8,

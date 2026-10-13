@@ -50,5 +50,10 @@ fi
 mv ../*.deb "$OUT/"
 echo ">> built:"
 ls -1 "$OUT"
-echo ">> install the ones you have now:"
+# PipeWire loads the IPA module from disk when an app opens a camera: an
+# old pipewire picking up the new IPA (different stats layout) fails the
+# stream and hangs on stop. Stop it before installing, start it after.
+echo ">> install the ones you have now (PipeWire stopped meanwhile):"
+echo "   systemctl --user stop wireplumber pipewire pipewire-pulse pipewire.socket pipewire-pulse.socket"
 echo "   sudo apt install $(cd "$OUT" && for d in *.deb; do pkg=${d%%_*}; dpkg -s "$pkg" >/dev/null 2>&1 && printf '%s ' "$OUT/$d"; done)"
+echo "   systemctl --user start pipewire.socket pipewire-pulse.socket pipewire pipewire-pulse wireplumber"

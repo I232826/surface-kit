@@ -1,0 +1,207 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: af: fine sweep, approach the peak from below, shorter settle
+
+Rear camera (ov8865 + dw9719) at ~20 cm, checked against raw frames with
+the lens set directly (sharp at 320-352): autofocus reported 261 and the
+image was as soft as at 260. Three causes:
+
+- settleFrames 5 is longer than the lens takes to show a move, so samples
+  were credited to the previous position; the peak moved with the setting
+  (256 at 5, 192 at 9) and 1-3 all agree on the right one. ov8865: 2.
+- the coarse 64 step is wider than the contrast peak at close range;
+  a second sweep in 16 steps (fineStep, 0 disables) covers one coarse step
+  either side of the coarse peak.
+- the voice coil lands lower coming down than going up, and the sweeps
+  measure going up: back off one coarse step below the peak and reach it
+  moving up. With the lens fixed at 336 the processed image is as sharp
+  as the raw one; autofocus now matches it.
+
+---
+--- a/src/ipa/simple/algorithms/af.h
++++ b/src/ipa/simple/algorithms/af.h
+@@ -32,6 +32,7 @@
+ 	enum class State {
+ 		Startup,	/* waiting for the exposure to settle */
+ 		Scan,		/* sweeping the lens */
++		Approach,	/* below the peak, to reach it moving up */
+ 		Final,		/* moved to the peak, waiting to measure it */
+ 		Locked,		/* in focus, watching for scene changes */
+ 		Changed,	/* scene changed, waiting for it to settle */
+@@ -44,12 +45,14 @@
+ 
+ 	void move(IPAContext &context, uint32_t frame, int32_t position);
+ 	bool sampleFor(uint32_t frame, int32_t *position) const;
+-	void startScan(IPAContext &context, uint32_t frame);
++	void startScan(IPAContext &context, uint32_t frame, int32_t from,
++		       int32_t to, int32_t step);
+ 	int32_t peak() const;
+ 	void lock(double score, double level);
+ 
+ 	/* Tuning */
+ 	int32_t step_;
++	int32_t fineStep_;
+ 	int32_t scanMax_;
+ 	uint32_t settleFrames_;
+ 	uint32_t startupFrames_;
+@@ -58,6 +61,9 @@
+ 	State state_;
+ 	uint32_t startFrame_;
+ 	int32_t nextPosition_;
++	int32_t scanEnd_;	/* last position of the current sweep */
++	int32_t scanStep_;	/* step of the current sweep */
++	int32_t target_;	/* peak to reach after the approach */
+ 	std::deque<Move> moves_;
+ 	std::vector<std::pair<int32_t, double>> samples_;
+ 	double bestScore_;
+--- a/src/ipa/simple/algorithms/af.cpp
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -30,15 +30,20 @@
+  * move in effect for its frame. That lets the sweep move the lens once per
+  * statistics frame instead of waiting for every move to show.
+  *
+- * Sweep from far (0) to near in coarse steps, stop once the measure has
+- * clearly passed a peak, and move to the peak refined by fitting a Gaussian
+- * through it and its neighbours. Then hold, and sweep again when the scene
+- * has changed and come to rest.
++ * Sweep from far (0) to near in coarse steps and stop once the measure has
++ * clearly passed a peak. At close range the contrast peak is narrower than a
++ * coarse step (ov8865 at ~20 cm: 0.031 / 0.060 / 0.037 at 192 / 256 / 320),
++ * so a second sweep in fine steps covers one coarse step either side of it.
++ * Move to the peak refined by fitting a Gaussian through it and its
++ * neighbours. Then hold, and sweep again when the scene has changed and come
++ * to rest.
+  */
+ 
+ int Af::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
+ {
+ 	step_ = tuningData["step"].get<int32_t>(64);
++	/* 0 disables the fine sweep */
++	fineStep_ = tuningData["fineStep"].get<int32_t>(16);
+ 	scanMax_ = tuningData["scanMax"].get<int32_t>(768);
+ 	settleFrames_ = tuningData["settleFrames"].get<uint32_t>(5);
+ 	startupFrames_ = tuningData["startupFrames"].get<uint32_t>(36);
+@@ -46,6 +51,8 @@
+ 
+ 	if (step_ <= 0)
+ 		step_ = 64;
++	if (fineStep_ < 0 || fineStep_ >= step_)
++		fineStep_ = 0;
+ 
+ 	return 0;
+ }
+@@ -97,19 +104,26 @@
+ 	return false;
+ }
+ 
+-void Af::startScan(IPAContext &context, uint32_t frame)
++void Af::startScan(IPAContext &context, uint32_t frame, int32_t from,
++		   int32_t to, int32_t step)
+ {
++	const auto &cfg = context.configuration.af;
++
+ 	state_ = State::Scan;
+ 	samples_.clear();
+ 	moves_.clear();
+ 	bestScore_ = 0.0;
+ 	pastPeak_ = 0;
+-	nextPosition_ = context.configuration.af.lensMin;
++	nextPosition_ = std::clamp(from, cfg.lensMin, cfg.lensMax);
++	scanEnd_ = std::min(to, cfg.lensMax);
++	scanStep_ = step;
+ 
+-	LOG(IPASoftAf, Debug) << "Scan from " << nextPosition_;
++	LOG(IPASoftAf, Debug)
++		<< "Scan from " << nextPosition_ << " to " << scanEnd_
++		<< " step " << scanStep_;
+ 
+ 	move(context, frame, nextPosition_);
+-	nextPosition_ += step_;
++	nextPosition_ += scanStep_;
+ }
+ 
+ int32_t Af::peak() const
+@@ -134,7 +148,7 @@
+ 		return position;
+ 
+ 	const double offset = std::clamp(0.5 * (l0 - l2) / denom, -0.5, 0.5);
+-	return position + static_cast<int32_t>(std::lround(offset * step_));
++	return position + static_cast<int32_t>(std::lround(offset * scanStep_));
+ }
+ 
+ void Af::lock(double score, double level)
+@@ -162,7 +176,8 @@
+ 		if (!startFrame_)
+ 			startFrame_ = frame ? frame : 1;
+ 		if (frame - startFrame_ >= startupFrames_)
+-			startScan(context, frame);
++			startScan(context, frame, context.configuration.af.lensMin,
++				  scanMax_, step_);
+ 		break;
+ 
+ 	case State::Scan: {
+@@ -182,21 +197,42 @@
+ 		}
+ 
+ 		const bool done = pastPeak_ >= 2 ||
+-				  (nextPosition_ > scanMax_ &&
++				  (nextPosition_ > scanEnd_ &&
+ 				   !samples_.empty() &&
+ 				   samples_.back().first == moves_.back().position);
+ 		if (done) {
+ 			const int32_t target = peak();
+ 			LOG(IPASoftAf, Debug) << "Peak at " << target;
++			if (scanStep_ == step_ && fineStep_) {
++				startScan(context, frame, target - step_,
++					  target + step_, fineStep_);
++				break;
++			}
++			/*
++			 * The voice coil lands at a different place coming down
++			 * than going up, and the sweeps measured going up: back
++			 * off below the peak and reach it from there.
++			 */
+ 			moves_.clear();
+-			move(context, frame, target);
+-			state_ = State::Final;
++			target_ = target;
++			move(context, frame, target - step_);
++			state_ = State::Approach;
+ 			break;
+ 		}
+ 
+-		if (nextPosition_ <= scanMax_) {
++		if (nextPosition_ <= scanEnd_) {
+ 			move(context, frame, nextPosition_);
+-			nextPosition_ += step_;
++			nextPosition_ += scanStep_;
++		}
++		break;
++	}
++
++	case State::Approach: {
++		int32_t position;
++		if (sampleFor(frame, &position) &&
++		    position == context.activeState.af.position) {
++			move(context, frame, target_);
++			state_ = State::Final;
+ 		}
+ 		break;
+ 	}
+@@ -231,7 +267,8 @@
+ 			stableCount_ = 0;
+ 
+ 		if (stableCount_ >= 2)
+-			startScan(context, frame);
++			startScan(context, frame, context.configuration.af.lensMin,
++				  scanMax_, step_);
+ 		break;
+ 	}
+ 
+--- a/src/ipa/simple/data/ov8865.yaml
++++ b/src/ipa/simple/data/ov8865.yaml
+@@ -53,4 +53,5 @@
+       highlightsMinTarget: 1.9
+   # contrast autofocus on the dw9719 VCM
+   - Af:
++      settleFrames: 2
+ ...

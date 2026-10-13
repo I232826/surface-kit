@@ -1,0 +1,430 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: AWB from the brightest pixels on a grey locus; Windows colour calibration
+
+Grey world is fooled by any scene dominated by one colour. Surface Pro 7
+rear camera, 3100 K lamp, white paper as reference: grey world was 20%
+off with the paper in view and 46% off on a teal-only scene (white paper
+rendered pink, lime rendered yellow).
+
+SwStats now also keeps colour sums of the unclipped sampled pixels per
+luminance histogram bin. With a "locus" in the tuning file (sensor R/G,
+B/G of neutral grey under known lights, warm to cool), Awb reads the light
+colour from the brightest 2% of unclipped pixels, snaps it onto the
+locus and smooths it over frames. Errors in the same two scenes: 3% and
+6%. Without a locus the behaviour is unchanged.
+
+Tuning (both Surface Pro 7 cameras, from the Windows driver's module
+calibration OV8865_MSHW0191_ICL.aiqb / OV5693_MSHW0190_ICL.cpf): grey
+locus, colour matrices for A/D50/D65/D75 keyed by the colour temperature
+the IPA's estimateCCT() reports for those lights, and AGC target 1.6 with
+contrast 1.4 (the old 2.2 / 1.0 left no pixel darker than mid grey).
+
+---
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -44,6 +44,15 @@
+ 	 */
+ 	Histogram yHistogram;
+ 	/**
++	 * \brief Colour sums of the unclipped sampled pixels per yHistogram
++	 *        bin, on the same 8-bit scale as \a sum_
++	 */
++	std::array<RGB<uint64_t>, kYHistogramSize> yBinSums;
++	/**
++	 * \brief Number of unclipped sampled pixels per yHistogram bin
++	 */
++	Histogram yBinCounts;
++	/**
+ 	 * \brief Focus measure: sum of absolute green differences between
+ 	 *        neighbouring sampled cells in the centre third of the image
+ 	 */
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -109,6 +109,8 @@
+ 	bool swapLines_;
+ 
+ 	unsigned int ySkipMask_;
++	/* scales yBinSums from sample values to the 8-bit stats scale */
++	unsigned int binSumsDiv_ = 1;
+ 
+ 	Rectangle window_;
+ 
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -164,6 +164,12 @@
+ 			<< "Failed to create shared memory for statistics";
+ }
+ 
++/*
++ * Pixels with a channel at or above this (8-bit scale) are left out of the
++ * per-bin colour sums: a clipped channel has lost its true ratio, so a
++ * clipped highlight would skew the light colour AWB reads from them.
++ */
++static constexpr unsigned int kClipLevel = 248;
+ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+@@ -184,7 +190,17 @@
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+ 	yVal += b * kBlueYMul;             \
+-	stats_.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++	{                                  \
++		unsigned int yBin = yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div)); \
++		stats_.yHistogram[yBin]++;                              \
++		if (r < kClipLevel * (div) && g < kClipLevel * (div) && \
++		    b < kClipLevel * (div)) {                           \
++			stats_.yBinSums[yBin].r() += r;                 \
++			stats_.yBinSums[yBin].g() += g;                 \
++			stats_.yBinSums[yBin].b() += b;                 \
++			stats_.yBinCounts[yBin]++;                      \
++		}                                                       \
++	}
+ 
+ /*
+  * The colour sums are kept on the 8-bit scale the black level and the packed
+@@ -373,6 +389,8 @@
+ 
+ 	stats_.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 	stats_.yHistogram.fill(0);
++	stats_.yBinSums.fill(RGB<uint64_t>({ 0, 0, 0 }));
++	stats_.yBinCounts.fill(0);
+ 	stats_.afContrast = 0;
+ 	stats_.afLevel = 0;
+ }
+@@ -387,6 +405,11 @@
+ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ {
+ 	stats_.valid = frame % kStatPerNumFrames == 0;
++	if (stats_.valid && binSumsDiv_ > 1) {
++		for (auto &s : stats_.yBinSums)
++			s = RGB<uint64_t>({ s.r() / binSumsDiv_, s.g() / binSumsDiv_,
++					    s.b() / binSumsDiv_ });
++	}
+ 	*sharedStats_ = stats_;
+ 	statsReady.emit(frame, bufferId);
+ }
+@@ -446,12 +469,15 @@
+ 		switch (bayerFormat.bitDepth) {
+ 		case 8:
+ 			stats0_ = &SwStatsCpu::statsBGGR8Line0;
++			binSumsDiv_ = 1;
+ 			return 0;
+ 		case 10:
+ 			stats0_ = &SwStatsCpu::statsBGGR10Line0;
++			binSumsDiv_ = 4;
+ 			return 0;
+ 		case 12:
+ 			stats0_ = &SwStatsCpu::statsBGGR12Line0;
++			binSumsDiv_ = 16;
+ 			return 0;
+ 		}
+ 	}
+@@ -464,6 +490,7 @@
+ 		ySkipMask_ = 0x02;
+ 		xShift_ = 0;
+ 		processFrame_ = &SwStatsCpu::processBayerFrame2;
++		binSumsDiv_ = 1;
+ 
+ 		switch (bayerFormat.order) {
+ 		case BayerFormat::BGGR:
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -7,6 +7,10 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <optional>
++#include <vector>
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -19,6 +23,7 @@
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const YamlObject &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+@@ -29,6 +34,19 @@
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	using Point = std::array<double, 2>;
++
++	std::optional<Point> brightestLight(const SwIspStats *stats,
++					    uint8_t blackLevel) const;
++	Point projectOnLocus(const Point &p) const;
++
++	/* grey locus: log2(R/G), log2(B/G) of neutral grey per light, warm to cool */
++	std::vector<Point> locus_;
++	double brightFraction_ = 0.02;
++	double speed_ = 0.3;
++	std::optional<Point> estimate_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "awb.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <numeric>
+ #include <stdint.h>
+ 
+@@ -14,6 +16,8 @@
+ 
+ #include <libcamera/control_ids.h>
+ 
++#include "libcamera/internal/yaml_parser.h"
++
+ #include "libipa/colours.h"
+ #include "simple/ipa_context.h"
+ 
+@@ -25,11 +29,50 @@
+ 
+ namespace ipa::soft::algorithms {
+ 
++/*
++ * With a "locus" in the tuning file, the light's colour is read from the
++ * brightest unclipped pixels (white objects and reflections show the light
++ * itself) and snapped onto the sensor's grey locus: the R/G, B/G a neutral
++ * surface gives under daylight and tungsten light, warm to cool, e.g. from
++ * the module's calibration. Grey world, the fallback without a locus, is
++ * fooled by any scene dominated by one colour; on a teal-dominated scene
++ * under a 3100 K lamp it was 46% off, this 6% (Surface Pro 7 rear camera,
++ * white paper reference).
++ *
++ *   - Awb:
++ *       locus: [ [ 0.880, 0.363 ], [ 0.528, 0.572 ], ... ]   # R/G, B/G
++ *       brightFraction: 0.02   # share of pixels taken as the brightest
++ *       speed: 0.3             # 0..1, smoothing between estimates
++ */
++int Awb::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	for (const auto &entry : tuningData["locus"].asList()) {
++		auto v = entry.getList<double>();
++		if (!v || v->size() != 2 || (*v)[0] <= 0 || (*v)[1] <= 0) {
++			LOG(IPASoftAwb, Error) << "Invalid locus point";
++			return -EINVAL;
++		}
++		locus_.push_back({ std::log2((*v)[0]), std::log2((*v)[1]) });
++	}
++	if (locus_.size() == 1) {
++		LOG(IPASoftAwb, Error) << "Locus needs at least two points";
++		return -EINVAL;
++	}
++	brightFraction_ = std::clamp(tuningData["brightFraction"].get<double>(0.02), 0.001, 1.0);
++	speed_ = std::clamp(tuningData["speed"].get<double>(0.3), 0.01, 1.0);
++
++	LOG(IPASoftAwb, Debug)
++		<< "locus with " << locus_.size() << " points, brightest "
++		<< brightFraction_ * 100 << "%";
++	return 0;
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+ 	auto &gains = context.activeState.awb.gains;
+ 	gains = { { 1.0, 1.0, 1.0 } };
++	estimate_.reset();
+ 
+ 	return 0;
+ }
+@@ -52,6 +95,56 @@
+ 	params->gains = gains;
+ }
+ 
++/* log2 chromaticity of the brightest brightFraction_ of unclipped pixels */
++std::optional<Awb::Point> Awb::brightestLight(const SwIspStats *stats,
++					      uint8_t blackLevel) const
++{
++	const uint64_t total = std::accumulate(stats->yBinCounts.begin(),
++					       stats->yBinCounts.end(), uint64_t(0));
++	const double want = std::max(total * brightFraction_, 16.0);
++	double r = 0, g = 0, b = 0, n = 0;
++
++	for (int bin = SwIspStats::kYHistogramSize - 1; bin >= 0 && n < want; bin--) {
++		const double count = stats->yBinCounts[bin];
++		if (!count)
++			continue;
++		/* take a share of the last bin, to land on the fraction */
++		const double share = std::min(1.0, (want - n) / count);
++		const RGB<uint64_t> &s = stats->yBinSums[bin];
++		r += share * (s.r() - blackLevel * count);
++		g += share * (s.g() - blackLevel * count);
++		b += share * (s.b() - blackLevel * count);
++		n += share * count;
++	}
++
++	/* too dark to tell: a few counts above black is noise */
++	if (n < 16 || g < n * 4 || r <= 0 || b <= 0)
++		return std::nullopt;
++
++	return Point{ std::log2(r / g), std::log2(b / g) };
++}
++
++/* nearest point on the locus polyline */
++Awb::Point Awb::projectOnLocus(const Point &p) const
++{
++	Point best = locus_.front();
++	double bestDist = INFINITY;
++
++	for (size_t i = 0; i + 1 < locus_.size(); i++) {
++		const Point &a = locus_[i], &c = locus_[i + 1];
++		const double dx = c[0] - a[0], dy = c[1] - a[1];
++		double t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy);
++		t = std::clamp(t, 0.0, 1.0);
++		const Point q{ a[0] + t * dx, a[1] + t * dy };
++		const double d = std::hypot(p[0] - q[0], p[1] - q[1]);
++		if (d < bestDist) {
++			bestDist = d;
++			best = q;
++		}
++	}
++	return best;
++}
++
+ void Awb::process(IPAContext &context,
+ 		  [[maybe_unused]] const uint32_t frame,
+ 		  IPAFrameContext &frameContext,
+@@ -86,15 +179,35 @@
+ 	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
+ 
+ 	/*
+-	 * Calculate red and blue gains for AWB.
+-	 * Clamp max gain at 4.0, this also avoids 0 division.
++	 * Calculate red and blue gains for AWB: from the light read off the
++	 * brightest pixels, else grey world snapped onto the locus, else plain
++	 * grey world clamped at 4.0 (which also avoids 0 division).
+ 	 */
+ 	auto &gains = context.activeState.awb.gains;
+-	gains = { {
+-		sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
+-		1.0,
+-		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
+-	} };
++
++	std::optional<Point> light;
++	if (!locus_.empty())
++		light = brightestLight(stats, blackLevel);
++	if (!light && !locus_.empty() && sum.r() > 0 && sum.b() > 0)
++		light = Point{ std::log2(static_cast<double>(sum.r()) / sum.g()),
++			       std::log2(static_cast<double>(sum.b()) / sum.g()) };
++	if (light) {
++		const Point target = projectOnLocus(*light);
++		if (!estimate_)
++			estimate_ = target;
++		else
++			for (unsigned int i = 0; i < 2; i++)
++				(*estimate_)[i] += speed_ * (target[i] - (*estimate_)[i]);
++
++		gains = { { static_cast<float>(std::exp2(-(*estimate_)[0])), 1.0f,
++			    static_cast<float>(std::exp2(-(*estimate_)[1])) } };
++	} else {
++		gains = { {
++			sum.r() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.r(),
++			1.0,
++			sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
++		} };
++	}
+ 
+ 	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+ 	context.activeState.awb.temperatureK = estimateCCT(rgbGains);
+--- a/src/ipa/simple/data/ov5693.yaml
++++ b/src/ipa/simple/data/ov5693.yaml
+@@ -9,7 +9,34 @@
+ algorithms:
+   - BlackLevel:
+       blackLevel: 1024
++  # white balance from the brightest pixels, snapped onto the grey locus:
++  # sensor R/G, B/G of neutral grey under A, D50, D65 and D75 light, from
++  # the Windows driver's calibration (OV5693_MSHW0190_ICL.cpf)
+   - Awb:
++      locus: [ [ 1.074, 0.378 ], [ 0.648, 0.578 ], [ 0.588, 0.734 ], [ 0.563, 0.736 ] ]
++  # colour matrices from the Windows driver's tuning file
++  # (OV5693_MSHW0190_ICL.cpf), daylight/tungsten light sources
++  - Ccm:
++      ccms:
++        - ct: 2790   # source 1, true 2664 K
++          ccm: [  1.6161, -0.3693, -0.2467,
++                 -0.4316,  1.7420, -0.3104,
++                 -0.2145, -1.1669,  2.3815 ]
++        - ct: 4560   # source 4, true 4556 K
++          ccm: [  1.7293, -0.5211, -0.2082,
++                 -0.2936,  1.7611, -0.4675,
++                 -0.0712, -0.6737,  1.7449 ]
++        - ct: 6090   # source 6, true 6254 K
++          ccm: [  1.5505, -0.3922, -0.1583,
++                 -0.2548,  1.6861, -0.4313,
++                 -0.0920, -0.4237,  1.5157 ]
++        - ct: 6220   # source 7, true 7053 K
++          ccm: [  1.7066, -0.6015, -0.1050,
++                 -0.2240,  1.6459, -0.4219,
++                 -0.0520, -0.4745,  1.5265 ]
++  # same tone as the rear camera (tested there, not on this one)
+   - Adjust:
++      contrast: 1.4
+   - Agc:
++      target: 1.6
+ ...
+--- a/src/ipa/simple/data/ov8865.yaml
++++ b/src/ipa/simple/data/ov8865.yaml
+@@ -9,18 +9,44 @@
+ algorithms:
+   - BlackLevel:
+       blackLevel: 1024
++  # white balance from the brightest pixels, snapped onto the grey locus:
++  # sensor R/G, B/G of neutral grey under A, D50, D65 and D75 light, from
++  # the Windows driver's calibration (OV8865_MSHW0191_ICL.aiqb)
+   - Awb:
++      locus: [ [ 0.880, 0.363 ], [ 0.528, 0.572 ], [ 0.454, 0.679 ], [ 0.456, 0.731 ] ]
++  # colour matrices from the Windows driver's tuning file
++  # (OV8865_MSHW0191_ICL.aiqb), daylight/tungsten light sources
++  - Ccm:
++      ccms:
++        - ct: 3130   # source 1, true 2283 K
++          ccm: [  1.7509, -0.1451, -0.6058,
++                 -0.7199,  2.2316, -0.5117,
++                 -0.6516, -2.0728,  3.7244 ]
++        - ct: 4900   # source 4, true 4604 K
++          ccm: [  1.8115, -0.5750, -0.2365,
++                 -0.3398,  1.8446, -0.5047,
++                 -0.0435, -0.8334,  1.8769 ]
++        - ct: 6030   # source 6, true 6267 K
++          ccm: [  1.8887, -0.7241, -0.1646,
++                 -0.3123,  1.8719, -0.5596,
++                 -0.0246, -0.7024,  1.7270 ]
++        - ct: 6610   # source 7, true 6964 K
++          ccm: [  1.8390, -0.7159, -0.1231,
++                 -0.2844,  1.7659, -0.4816,
++                 -0.0345, -0.5874,  1.6219 ]
++  # with the colour matrices the image needs some contrast to not look milky
+   - Adjust:
++      contrast: 1.4
+   # lens shading, fitted on a flat field (camera/scripts/lsc-fit.py):
+   # the corners of the full 4:3 frame are ~3x darker than the centre
+   - Lsc:
+       k1: [ 1.3212, 1.1457, 0.9666 ]
+       k2: [ 0.0331, -0.0020, 0.0495 ]
+-  # Picked by comparing variants on a white object in a dark scene: a
+-  # lower target than the default 2.5 and highlight protection that acts
+-  # earlier keep whites readable; a contrast curve made them glow again.
++  # A low target and highlight protection that acts early keep whites
++  # readable; 1.6 with contrast 1.4 above, compared against a phone photo,
++  # gives real blacks without the washed-out look of the old 2.2 / 1.0.
+   - Agc:
+-      target: 2.2
++      target: 1.6
+       highlightsLevel: 224
+       highlightsLow: 0.005
+       highlightsHigh: 0.03

@@ -1,0 +1,160 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: af: ignore wobble, refocus around the last focus first
+
+Handheld, every small wobble blurred a few frames, and three changed
+statistics (~0.4 s) were enough to start a full sweep from infinity once
+the camera held still again: visible pumping for nothing.
+
+- a change must last changeFrames statistics (default 8, ~1 s at 30 fps)
+- once the scene is at rest again (stableFrames, default 3), compare it
+  with the locked focus: if contrast and level are back within
+  changeThreshold, keep the focus without sweeping
+- otherwise sweep localRange coarse steps (default 2) either side of the
+  current position first, and the full range only if the peak lies at the
+  edge of that
+
+---
+--- a/src/ipa/simple/algorithms/af.h
++++ b/src/ipa/simple/algorithms/af.h
+@@ -48,6 +48,7 @@
+ 	void startScan(IPAContext &context, uint32_t frame, int32_t from,
+ 		       int32_t to, int32_t step);
+ 	int32_t peak() const;
++	bool peakInside(const IPAContext &context) const;
+ 	void lock(double score, double level);
+ 
+ 	/* Tuning */
+@@ -57,6 +58,9 @@
+ 	uint32_t settleFrames_;
+ 	uint32_t startupFrames_;
+ 	double changeThreshold_;
++	unsigned int changeFrames_;
++	unsigned int stableFrames_;
++	int32_t localRange_;
+ 
+ 	State state_;
+ 	uint32_t startFrame_;
+@@ -64,6 +68,7 @@
+ 	int32_t scanEnd_;	/* last position of the current sweep */
+ 	int32_t scanStep_;	/* step of the current sweep */
+ 	int32_t target_;	/* peak to reach after the approach */
++	bool localScan_;	/* sweep around the last focus, not the full range */
+ 	std::deque<Move> moves_;
+ 	std::vector<std::pair<int32_t, double>> samples_;
+ 	double bestScore_;
+--- a/src/ipa/simple/algorithms/af.cpp
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -35,8 +35,14 @@
+  * coarse step (ov8865 at ~20 cm: 0.031 / 0.060 / 0.037 at 192 / 256 / 320),
+  * so a second sweep in fine steps covers one coarse step either side of it.
+  * Move to the peak refined by fitting a Gaussian through it and its
+- * neighbours. Then hold, and sweep again when the scene has changed and come
+- * to rest.
++ * neighbours. Then hold.
++ *
++ * Handheld, the measure jumps whenever the camera wobbles, so a refocus
++ * needs the change to last (changeFrames statistics, ~1 s) and the scene to
++ * come to rest again. If it then matches the locked focus, nothing moved
++ * that matters and focus stays. Otherwise sweep around the last focus
++ * first (localRange coarse steps either side), and the full range only if
++ * the peak lies at the edge of that.
+  */
+ 
+ int Af::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
+@@ -48,6 +54,10 @@
+ 	settleFrames_ = tuningData["settleFrames"].get<uint32_t>(5);
+ 	startupFrames_ = tuningData["startupFrames"].get<uint32_t>(36);
+ 	changeThreshold_ = tuningData["changeThreshold"].get<double>(0.35);
++	/* statistics come every 4th frame: 8 is about one second at 30 fps */
++	changeFrames_ = std::max(tuningData["changeFrames"].get<uint32_t>(8), 1u);
++	stableFrames_ = std::max(tuningData["stableFrames"].get<uint32_t>(3), 1u);
++	localRange_ = tuningData["localRange"].get<int32_t>(2);
+ 
+ 	if (step_ <= 0)
+ 		step_ = 64;
+@@ -117,6 +127,7 @@
+ 	nextPosition_ = std::clamp(from, cfg.lensMin, cfg.lensMax);
+ 	scanEnd_ = std::min(to, cfg.lensMax);
+ 	scanStep_ = step;
++	localScan_ = false;
+ 
+ 	LOG(IPASoftAf, Debug)
+ 		<< "Scan from " << nextPosition_ << " to " << scanEnd_
+@@ -151,6 +162,27 @@
+ 	return position + static_cast<int32_t>(std::lround(offset * scanStep_));
+ }
+ 
++/*
++ * Whether the best sample of the sweep has a lower sample on both sides,
++ * or sits at the end of the lens range (where a wider sweep can't help).
++ */
++bool Af::peakInside(const IPAContext &context) const
++{
++	auto best = std::max_element(samples_.begin(), samples_.end(),
++				     [](const auto &a, const auto &b) {
++					     return a.second < b.second;
++				     });
++	if (best == samples_.end())
++		return true;
++
++	const auto &cfg = context.configuration.af;
++	if (best == samples_.begin())
++		return best->first <= cfg.lensMin;
++	if (best + 1 == samples_.end())
++		return best->first >= cfg.lensMax;
++	return true;
++}
++
+ void Af::lock(double score, double level)
+ {
+ 	state_ = State::Locked;
+@@ -203,6 +235,12 @@
+ 		if (done) {
+ 			const int32_t target = peak();
+ 			LOG(IPASoftAf, Debug) << "Peak at " << target;
++			if (localScan_ && !peakInside(context)) {
++				LOG(IPASoftAf, Debug) << "Peak at the edge, full sweep";
++				startScan(context, frame, context.configuration.af.lensMin,
++					  scanMax_, step_);
++				break;
++			}
+ 			if (scanStep_ == step_ && fineStep_) {
+ 				startScan(context, frame, target - step_,
+ 					  target + step_, fineStep_);
+@@ -252,7 +290,7 @@
+ 		else
+ 			changedCount_ = 0;
+ 
+-		if (changedCount_ >= 3) {
++		if (changedCount_ >= changeFrames_) {
+ 			state_ = State::Changed;
+ 			stableCount_ = 0;
+ 		}
+@@ -266,9 +304,26 @@
+ 		else
+ 			stableCount_ = 0;
+ 
+-		if (stableCount_ >= 2)
++		if (stableCount_ < stableFrames_)
++			break;
++
++		/* back to what it was in focus on: just a wobble */
++		if (std::abs(score / lockedScore_ - 1.0) <= changeThreshold_ &&
++		    std::abs(level / lockedLevel_ - 1.0) <= changeThreshold_) {
++			LOG(IPASoftAf, Debug) << "Scene back as locked, keeping focus";
++			lock(lockedScore_, lockedLevel_);
++			break;
++		}
++
++		if (localRange_ > 0) {
++			const int32_t pos = context.activeState.af.position;
++			startScan(context, frame, pos - localRange_ * step_,
++				  pos + localRange_ * step_, step_);
++			localScan_ = true;
++		} else {
+ 			startScan(context, frame, context.configuration.af.lensMin,
+ 				  scanMax_, step_);
++		}
+ 		break;
+ 	}
+ 

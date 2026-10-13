@@ -1,0 +1,48 @@
+ipu4: optionally power-cycle the sensor on stream-start bounces
+
+relock_power_cycle=1 makes each stream-start (and relock) bounce suspend
+the sensor through runtime PM, so the retry starts from a full power-up
+instead of the same powered state: s_stream(0) alone leaves the ov5693
+powered for its 1 s autosuspend delay. Off by default; for measuring.
+
+---
+--- a/ipu-isys-queue.c	2026-10-07 16:17:34.095974902 +0200
++++ b/ipu-isys-queue.c	2026-10-07 16:17:34.109181350 +0200
+@@ -5,6 +5,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/pm_runtime.h>
+ #include <linux/workqueue.h>
+ #include <linux/string.h>
+ 
+@@ -617,6 +618,16 @@
+  * retrying and let the capture proceed with whatever the last attempt
+  * achieved.
+  */
++/*
++ * A bounce only toggles the sensor's s_stream, and the sensor's runtime PM
++ * autosuspend (1 s on ov5693) keeps it powered through it, so every retry
++ * starts from the same sensor state. With this set, each bounce suspends the
++ * sensor for a full power-off/on (supplies, reset, clock, register init).
++ */
++static bool relock_power_cycle;
++module_param(relock_power_cycle, bool, 0644);
++MODULE_PARM_DESC(relock_power_cycle, "Power-cycle the sensor on each stream-start bounce (default: off)");
++
+ static void verify_stream_start(struct ipu_isys_pipeline *ip)
+ {
+ 	struct ipu_isys_video *pipe_av =
+@@ -654,6 +665,12 @@
+ 		v4l2_subdev_call(esd, video, s_stream, 0);
+ 		/* log + clear accumulated receiver errors */
+ 		ipu_isys_csi2_error(ip->csi2);
++		if (relock_power_cycle && esd->dev) {
++			rval = pm_runtime_suspend(esd->dev);
++			if (rval < 0)
++				dev_warn(dev, "sensor power-off for bounce failed: %d\n",
++					 rval);
++		}
+ 		msleep(20);
+ 		rval = v4l2_subdev_call(esd, video, s_stream, 1);
+ 		if (rval) {

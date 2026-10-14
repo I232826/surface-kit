@@ -1,0 +1,110 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: af: refocus when an app touches a trigger file
+
+Apps show the camera through PipeWire, which doesn't pass
+controls::AfTrigger on, so a "focus again" button or a tap on the picture
+had no way to reach the autofocus. Af now watches the time stamp of
+$XDG_RUNTIME_DIR/libcamera-af-trigger (one stat() every 5 frames) and
+starts a full sweep when it changes; the stamp at configure() is taken as
+seen, so a stale file does nothing. GNOME Camera (surface-kit patch)
+writes it. Measured: sweep starts within 0.25 s, focused ~1.4 s later.
+
+---
+--- a/src/ipa/simple/algorithms/af.h
++++ b/src/ipa/simple/algorithms/af.h
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <deque>
++#include <string>
+ #include <vector>
+ 
+ #include "algorithm.h"
+@@ -50,6 +51,7 @@
+ 	int32_t peak() const;
+ 	bool peakInside(const IPAContext &context) const;
+ 	void lock(double score, double level);
++	bool triggered(uint32_t frame);
+ 
+ 	/* Tuning */
+ 	int32_t step_;
+@@ -63,6 +65,10 @@
+ 	int32_t localRange_;
+ 
+ 	State state_;
++	/* external refocus request: time stamp of a trigger file */
++	std::string triggerPath_;
++	int64_t triggerStamp_ = 0;
++	uint32_t triggerChecked_ = 0;
+ 	uint32_t startFrame_;
+ 	int32_t nextPosition_;
+ 	int32_t scanEnd_;	/* last position of the current sweep */
+--- a/src/ipa/simple/algorithms/af.cpp
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -7,6 +7,9 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
++
++#include <sys/stat.h>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -70,9 +73,40 @@
+ 	return 0;
+ }
+ 
++/*
++ * Apps can ask for a fresh sweep (a focus button, a tap on the picture) by
++ * changing the time stamp of $XDG_RUNTIME_DIR/libcamera-af-trigger: the
++ * picture often reaches them through PipeWire, which doesn't pass
++ * controls::AfTrigger on. Checked every few frames; one stat() call.
++ */
++static int64_t fileStamp(const std::string &path)
++{
++	struct stat st;
++	if (path.empty() || stat(path.c_str(), &st))
++		return 0;
++	return static_cast<int64_t>(st.st_mtim.tv_sec) * 1000000000 + st.st_mtim.tv_nsec;
++}
++
++bool Af::triggered(uint32_t frame)
++{
++	if (frame - triggerChecked_ < 5)
++		return false;
++	triggerChecked_ = frame;
++	const int64_t stamp = fileStamp(triggerPath_);
++	if (stamp == triggerStamp_)
++		return false;
++	triggerStamp_ = stamp;
++	return true;
++}
++
+ int Af::configure(IPAContext &context,
+ 		  [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
++	const char *runtime = std::getenv("XDG_RUNTIME_DIR");
++	triggerPath_ = runtime ? std::string(runtime) + "/libcamera-af-trigger" : "";
++	triggerStamp_ = fileStamp(triggerPath_);
++	triggerChecked_ = 0;
++
+ 	state_ = State::Startup;
+ 	startFrame_ = 0;
+ 	moves_.clear();
+@@ -220,6 +254,15 @@
+ 	const double level = static_cast<double>(stats->afLevel);
+ 	const double score = stats->afContrast / level;
+ 
++	if (state_ != State::Startup && triggered(frame)) {
++		LOG(IPASoftAf, Debug) << "Refocus requested";
++		startScan(context, frame, context.configuration.af.lensMin,
++			  scanMax_, step_);
++		lastScore_ = score;
++		lastLevel_ = level;
++		return;
++	}
++
+ 	switch (state_) {
+ 	case State::Startup:
+ 		/*

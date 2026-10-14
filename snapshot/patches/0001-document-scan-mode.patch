@@ -10,9 +10,14 @@ the largest wins),
 its four corners taken from the convex hull. A dialog shows the photo
 with that outline and a handle on each corner to drag (a page on other
 white paper has no edge to find); without a page it starts just inside
-the frame. Save warps the page to an upright rectangle and evens out the
-paper per colour channel to neutral white; the photo stays next to the
-scan. Plain Rust and cairo, no new crates.
+the frame. Save warps the page to an upright rectangle, evens out the
+paper per colour channel to neutral white, and cleans it up like a
+scanner, adapted to the page's measured noise (dim rooms mean high gain):
+3x3 median and a 5x5 sigma filter on luma, a box on chroma, an unsharp
+mask on luma for text edges, and levels with a 1.3 gamma that take paper
+plus its grain to white and ink to neutral black while keeping thin lines
+and coloured marks.
+The photo stays next to the scan. Plain Rust and cairo, no new crates.
 
 The camera streams at 1080p at most; in document mode aperture switches
 to the sensor's full resolution with 4:3 preferred (3200x2400 on the
@@ -279,7 +284,7 @@ Surface Pro 7 rear camera), restarting a running stream.
      /// A black frame will be shown after this methods has been called.
 --- /dev/null
 +++ b/src/document.rs
-@@ -0,0 +1,721 @@
+@@ -0,0 +1,859 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Document scans: find the page in a photo, straighten it and even out the
 +//! paper, without any image processing library.
@@ -373,6 +378,7 @@ Surface Pro 7 rear camera), restarting a running stream.
 +pub fn save_scan(prep: &Prepared, corners: &[Point; 4], out: &Path) -> anyhow::Result<()> {
 +    let mut page = warp(&prep.photo, &order_corners(*corners));
 +    whiten(&mut page);
++    enhance(&mut page);
 +    save_jpeg(&page, out)
 +}
 +
@@ -941,7 +947,9 @@ Surface Pro 7 rear camera), restarting a running stream.
 +                }
 +            }
 +            px.sort_unstable_by_key(|p| p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29);
-+            let top = &px[px.len() * 8 / 10..px.len() * 95 / 100 + 1];
++            // 60-80th percentile: paper, clear of ink below and of noise
++            // peaks above (a dim room's high gain puts many there)
++            let top = &px[px.len() * 6 / 10..px.len() * 8 / 10 + 1];
 +            for c in 0..3 {
 +                grid[by * bw + bx][c] =
 +                    top.iter().map(|p| p[c] as f64).sum::<f64>() / top.len() as f64;
@@ -990,6 +998,141 @@ Surface Pro 7 rear camera), restarting a running stream.
 +            }
 +        }
 +    }
++}
++
++/// Make the evened-out page read like a scan. The page's own noise is
++/// measured first (shots in a dim room carry a lot), and both the smoothing
++/// and the white point follow it:
++///
++/// - luma: 3x3 median, then a 5x5 sigma filter that only averages
++///   neighbours within 2.5 noise levels of a pixel, so paper goes smooth
++///   while text edges, far outside that range, stay sharp
++/// - chroma: 5x5 box, against colour blotches
++/// - an unsharp mask on luma for crisp text edges, without colour fringes
++/// - levels: paper minus 2.5 noise levels to white (the grain with it), the
++///   darkest 0.5% towards black, and a 1.3 gamma so thin light lines (staff
++///   lines, pencil) gain contrast instead of fading. Weak chroma and chroma
++///   on near-white paper go, so paper is white and black ink neutral, while
++///   coloured marks keep their colour.
++fn enhance(img: &mut Rgb) {
++    let (w, h) = (img.w, img.h);
++    if w < 5 || h < 5 {
++        return;
++    }
++    let n = w * h;
++    let mut y = vec![0f32; n];
++    let mut cb = vec![0f32; n];
++    let mut cr = vec![0f32; n];
++    for i in 0..n {
++        let (r, g, b) = (img.data[3 * i] as f32, img.data[3 * i + 1] as f32, img.data[3 * i + 2] as f32);
++        let l = 0.299 * r + 0.587 * g + 0.114 * b;
++        y[i] = l;
++        cb[i] = b - l;
++        cr[i] = r - l;
++    }
++    let idx = |x: isize, yy: isize| -> usize {
++        yy.clamp(0, h as isize - 1) as usize * w + x.clamp(0, w as isize - 1) as usize
++    };
++
++    let mut ym = vec![0f32; n];
++    for yy in 0..h as isize {
++        for x in 0..w as isize {
++            let mut win = [0f32; 9];
++            let mut k = 0;
++            for dy in -1..=1 {
++                for dx in -1..=1 {
++                    win[k] = y[idx(x + dx, yy + dy)];
++                    k += 1;
++                }
++            }
++            win.sort_unstable_by(f32::total_cmp);
++            ym[yy as usize * w + x as usize] = win[4];
++        }
++    }
++
++    let (paper, noise) = paper_noise(&ym);
++    let reach = 2.5 * noise.max(1.0);
++    log::debug!("paper level {paper:.0}, noise {noise:.1}");
++
++    let mut yd = vec![0f32; n];
++    let mut cbd = vec![0f32; n];
++    let mut crd = vec![0f32; n];
++    for yy in 0..h as isize {
++        for x in 0..w as isize {
++            let c = ym[yy as usize * w + x as usize];
++            let (mut s, mut k) = (0f32, 0f32);
++            let (mut sb, mut sr) = (0f32, 0f32);
++            for dy in -2..=2 {
++                for dx in -2..=2 {
++                    let j = idx(x + dx, yy + dy);
++                    if (ym[j] - c).abs() <= reach {
++                        s += ym[j];
++                        k += 1.0;
++                    }
++                    sb += cb[j];
++                    sr += cr[j];
++                }
++            }
++            let i = yy as usize * w + x as usize;
++            yd[i] = s / k;
++            cbd[i] = sb / 25.0;
++            crd[i] = sr / 25.0;
++        }
++    }
++
++    const AMOUNT: f32 = 1.2;
++    let mut ys = vec![0f32; n];
++    for yy in 0..h as isize {
++        for x in 0..w as isize {
++            let mut blur = 0f32;
++            for dy in -1..=1isize {
++                for dx in -1..=1isize {
++                    let wgt = [1.0, 2.0, 1.0][(dx + 1) as usize] * [1.0, 2.0, 1.0][(dy + 1) as usize];
++                    blur += wgt * yd[idx(x + dx, yy + dy)];
++                }
++            }
++            let i = yy as usize * w + x as usize;
++            ys[i] = yd[i] + AMOUNT * (yd[i] - blur / 16.0);
++        }
++    }
++
++    let mut sorted = yd.clone();
++    sorted.sort_unstable_by(f32::total_cmp);
++    let black = sorted[n / 200].clamp(10.0, 110.0);
++    let white = (paper - 2.5 * noise).clamp(150.0, 238.0).max(black + 40.0);
++    for i in 0..n {
++        let l = ((ys[i] - black) / (white - black)).clamp(0.0, 1.0);
++        // chroma fades between 88% and 98% of white, and weak chroma goes
++        // altogether: grey and black ink stay neutral instead of carrying a
++        // purple fringe of sensor colour noise, while marker and pen
++        // colours, far stronger, stay
++        let strength = (cbd[i] * cbd[i] + crd[i] * crd[i]).sqrt();
++        let keep = ((0.98 - l) / 0.10).clamp(0.0, 1.0) * ((strength - 10.0) / 15.0).clamp(0.0, 1.0);
++        let l = l.powf(1.3) * 255.0;
++        let (b, r) = (cbd[i] * keep, crd[i] * keep);
++        let g = (l - 0.299 * (l + r) - 0.114 * (l + b)) / 0.587;
++        img.data[3 * i] = (l + r).clamp(0.0, 255.0).round() as u8;
++        img.data[3 * i + 1] = g.clamp(0.0, 255.0).round() as u8;
++        img.data[3 * i + 2] = (l + b).clamp(0.0, 255.0).round() as u8;
++    }
++}
++
++/// Paper level (the most common bright luma) and its noise: the spread of
++/// paper pixels above that level, which ink can't reach (median absolute
++/// deviation, as a standard deviation).
++fn paper_noise(y: &[f32]) -> (f32, f32) {
++    let mut hist = [0u32; 256];
++    for &v in y {
++        hist[v.clamp(0.0, 255.0) as usize] += 1;
++    }
++    let paper = (96..256).max_by_key(|&i| hist[i]).unwrap_or(245) as f32;
++    let mut above: Vec<f32> = y.iter().filter(|&&v| v > paper).map(|&v| v - paper).collect();
++    if above.len() < 100 {
++        return (paper, 2.0);
++    }
++    let mid = above.len() / 2;
++    let (_, m, _) = above.select_nth_unstable_by(mid, f32::total_cmp);
++    (paper, (*m / 0.6745).clamp(1.0, 40.0))
 +}
 +
 +/// The page corners `scan` would use, in photo pixels (for testing).

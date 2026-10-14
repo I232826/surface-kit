@@ -1,0 +1,70 @@
+From: surface-kit
+Subject: [PATCH] ipa: simple: af: park the lens at the sweep start; settle long moves
+
+The first sample of a sweep often read high and a sweep starting at
+infinity took it for a peak (1 run in 6 ended at 0). The IPA assumed the
+lens at 0 while it rested at the driver's default (dw9719 default_focus
+256, near focus), so the jump to 0 got no extra time and was measured
+mid-way. Startup now parks the lens at the sweep start; long moves get a
+frame per 96 steps of travel and hold the next sweep move back. 10 runs
+out of 10 end at 333-345 against a raw-frame sweep's 336-352.
+
+---
+--- a/src/ipa/simple/algorithms/af.h
++++ b/src/ipa/simple/algorithms/af.h
+@@ -68,6 +68,7 @@
+ 	int32_t scanEnd_;	/* last position of the current sweep */
+ 	int32_t scanStep_;	/* step of the current sweep */
+ 	int32_t target_;	/* peak to reach after the approach */
++	uint32_t holdUntil_ = 0;	/* no new sweep move before this frame */
+ 	bool localScan_;	/* sweep around the last focus, not the full range */
+ 	std::deque<Move> moves_;
+ 	std::vector<std::pair<int32_t, double>> samples_;
+--- a/src/ipa/simple/algorithms/af.cpp
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -93,10 +93,21 @@
+ 	const auto &cfg = context.configuration.af;
+ 	position = std::clamp(position, cfg.lensMin, cfg.lensMax);
+ 
++	/*
++	 * A long jump (to the start of a sweep, or back below the peak) takes
++	 * the lens more than settleFrames to finish: measured mid-way it reads
++	 * as sharp, and a sweep starting at infinity took that for a peak. Add
++	 * a frame per 96 steps of travel, and hold the next sweep move back
++	 * until it has arrived.
++	 */
++	const uint32_t travel = std::min<uint32_t>(
++		std::abs(position - context.activeState.af.position) / 96, 3);
++	holdUntil_ = frame + travel;
++
+ 	context.activeState.af.position = position;
+ 	context.activeState.af.changed = true;
+ 
+-	moves_.push_back({ position, frame + settleFrames_ });
++	moves_.push_back({ position, frame + settleFrames_ + travel });
+ 	while (moves_.size() > 16)
+ 		moves_.pop_front();
+ }
+@@ -219,6 +230,13 @@
+ 		if (!startFrame_) {
+ 			startFrame_ = frame ? frame : 1;
+ 			stableCount_ = 0;
++			/*
++			 * The lens rests wherever the driver left it (dw9719
++			 * default_focus 256), not at the 0 assumed here: park it
++			 * where the sweep starts, so it has arrived by then.
++			 */
++			context.activeState.af.position = -1;
++			move(context, frame, context.configuration.af.lensMin);
+ 		} else if (std::abs(level / lastLevel_ - 1.0) < 0.05 &&
+ 			   std::abs(score / lastScore_ - 1.0) < 0.1) {
+ 			stableCount_++;
+@@ -277,7 +295,7 @@
+ 			break;
+ 		}
+ 
+-		if (nextPosition_ <= scanEnd_) {
++		if (nextPosition_ <= scanEnd_ && frame >= holdUntil_) {
+ 			move(context, frame, nextPosition_);
+ 			nextPosition_ += scanStep_;
+ 		}

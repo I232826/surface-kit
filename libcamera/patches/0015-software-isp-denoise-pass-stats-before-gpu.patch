@@ -1,0 +1,467 @@
+From: surface-kit
+Subject: [PATCH] software_isp: edge-preserving denoise pass; statistics before the GPU pass
+
+At high gain (13x in a dim room) the rear camera image was grainy with
+coloured speckles. The GPU debayer now renders into an intermediate RGB
+texture and a second pass (denoise.frag) writes the output: luma smoothed
+over 3x3 with weights from luma similarity, chroma averaged over 3x3 taps
+4 pixels apart with a 3x wider tolerance, so colour speckles go but edges
+and texture stay. 18 texture reads per pixel keep 3264x1836 at the
+sensor's 20 fps on the Ice Lake GPU (a 5x5/5x5 version dropped to 18).
+
+The strength comes from a new IPA algorithm, Denoise: sigma (output
+noise at unity gain, 8-bit levels) times the square root of the gain,
+capped at maxSigma. Picked on a textured wall at 13x: sigma 2.8 (10 at
+13x). Without the algorithm the image is unchanged.
+
+The statistics were taken after the GPU pass and its glFinish, so any GPU
+work delayed every measurement autofocus pairs with a lens position: with
+the denoise pass its sweeps shifted a step and missed. They only need the
+raw input and are now taken first.
+
+---
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -30,6 +30,11 @@
+ 	 */
+ 	RGB<float> lscK1;
+ 	RGB<float> lscK2;
++	/*
++	 * Noise standard deviation of the output (gamma) image, 0..1, for the
++	 * GPU debayer's denoise pass; 0 leaves the image as it is.
++	 */
++	float denoiseSigma;
+ };
+ 
+ } /* namespace libcamera */
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -65,6 +65,7 @@
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	void pushEnv(std::vector<std::string> &shaderEnv, const char *str);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
++	int initDenoiseShaders();
+ 	int initEGLContext();
+ 	int generateTextures();
+ 	int compileShaderProgram(GLuint &shaderId, GLenum shaderType,
+@@ -80,10 +81,15 @@
+ 	GLuint vertexShaderId_ = 0;
+ 	GLuint fragmentShaderId_ = 0;
+ 	GLuint programId_ = 0;
++	GLuint denoiseProgramId_ = 0;
++	/* SWAP_BLUE output order, applied by the last pass */
++	bool swapBlue_ = false;
+ 
+ 	/* Pointer to object representing input texture */
+ 	std::unique_ptr<eGLImage> eglImageBayerIn_;
+ 	std::unique_ptr<eGLImage> eglImageBayerOut_;
++	/* Debayered RGB between the Bayer pass and the denoise pass */
++	std::unique_ptr<eGLImage> eglImageRGB_;
+ 
+ 	/* Shader parameters */
+ 	float firstRed_x_;
+@@ -113,6 +119,15 @@
+ 	GLint lscK2UniformDataIn_;
+ 	GLint lscInvHalfWidthUniformDataIn_;
+ 
++	/* Denoise pass */
++	GLint denoiseAttributeVertex_;
++	GLint denoiseAttributeTexture_;
++	GLint denoiseUniformTexture_;
++	GLint denoiseUniformTexel_;
++	GLint denoiseUniformSigma_;
++	GLint denoiseUniformProjMatrix_;
++	GLint denoiseUniformStrideFactor_;
++
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+ 	eGL egl_;
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -153,7 +153,8 @@
+ 		break;
+ 	case formats::ABGR8888:
+ 	case formats::XBGR8888:
+-		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++		/* applied by the denoise pass, which writes the output */
++		swapBlue_ = true;
+ 		break;
+ 	default:
+ 		LOG(Debayer, Error) << "Unsupported output format";
+@@ -524,11 +525,44 @@
+ 	/* Generate the output render framebuffer as render to texture */
+ 	egl_.createOutputDMABufTexture2D(*eglImageBayerOut_, out_fd);
+ 
++	/* Pass 1: debayer into the intermediate RGB texture */
++	egl_.useProgram(programId_);
++	glBindFramebuffer(GL_FRAMEBUFFER, eglImageRGB_->fbo_);
+ 	setShaderVariableValues(params);
+ 	glViewport(0, 0, width_, height_);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+ 	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
+ 
++	/* Pass 2: denoise into the output buffer */
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f }, { -1.0f, +1.0f }, { +1.0f, +1.0f }, { +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f }, { 0.0f, 1.0f }, { 1.0f, 1.0f }, { 1.0f, 0.0f },
++	};
++	static const GLfloat identity[16] = {
++		1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
++	};
++	const GLfloat texel[2] = { 1.0f / outputSize_.width, 1.0f / outputSize_.height };
++
++	egl_.useProgram(denoiseProgramId_);
++	glBindFramebuffer(GL_FRAMEBUFFER, eglImageBayerOut_->fbo_);
++	glEnableVertexAttribArray(denoiseAttributeVertex_);
++	glVertexAttribPointer(denoiseAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(denoiseAttributeTexture_);
++	glVertexAttribPointer(denoiseAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++	glActiveTexture(eglImageRGB_->texture_unit_);
++	glBindTexture(GL_TEXTURE_2D, eglImageRGB_->texture_);
++	glUniform1i(denoiseUniformTexture_, eglImageRGB_->texture_unit_uniform_id_);
++	glUniform2fv(denoiseUniformTexel_, 1, texel);
++	glUniform1f(denoiseUniformSigma_, params.denoiseSigma);
++	glUniformMatrix4fv(denoiseUniformProjMatrix_, 1, GL_FALSE, identity);
++	glUniform1f(denoiseUniformStrideFactor_, 1.0f);
++	glViewport(0, 0, outputSize_.width, outputSize_.height);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++
+ 	GLenum err = glGetError();
+ 	if (err != GL_NO_ERROR) {
+ 		LOG(eGL, Error) << "Drawing scene fail " << err;
+@@ -560,6 +594,13 @@
+ 		goto error;
+ 	}
+ 
++	/*
++	 * Statistics only need the raw input: take them before the GPU pass,
++	 * whose time would otherwise delay every measurement autofocus pairs
++	 * with a lens position (a denoise pass shifted its sweeps a step).
++	 */
++	stats_->processFrame(frame, 0, input);
++
+ 	if (debayerGPU(in, output->planes()[0].fd.get(), params)) {
+ 		LOG(Debayer, Error) << "debayerGPU failed";
+ 		goto error;
+@@ -569,8 +610,6 @@
+ 
+ 	metadata.planes()[0].bytesused = output->planes()[0].length;
+ 
+-	/* Calculate stats for the whole frame */
+-	stats_->processFrame(frame, 0, input);
+ 	dmaSyncers.clear();
+ 
+ 	outputBufferReady.emit(output);
+@@ -604,14 +643,71 @@
+ 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
+ 		return -EINVAL;
+ 
++	/* Debayered RGB, read back by the denoise pass */
++	eglImageRGB_ = std::make_unique<eGLImage>(outputSize_.width, outputSize_.height,
++						  outputSize_.width * 4, GL_TEXTURE2, 2);
++	egl_.createTexture2D(*eglImageRGB_, GL_RGBA, outputSize_.width,
++			     outputSize_.height, nullptr);
++	glBindFramebuffer(GL_FRAMEBUFFER, eglImageRGB_->fbo_);
++	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++			       eglImageRGB_->texture_, 0);
++	if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++		LOG(Debayer, Error) << "Intermediate framebuffer incomplete";
++		return -ENODEV;
++	}
++
++	if (initDenoiseShaders())
++		return -EINVAL;
++
++	return 0;
++}
++
++int DebayerEGL::initDenoiseShaders()
++{
++	std::vector<std::string> shaderEnv;
++	GLuint vertexShaderId, fragmentShaderId;
++
++	egl_.pushEnv(shaderEnv, "#version 100");
++	if (swapBlue_)
++		egl_.pushEnv(shaderEnv, "#define SWAP_BLUE");
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, identity_vert_len, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile denoise vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, denoise_frag, denoise_frag_len, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile denoise fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(denoiseProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking denoise program fail";
++		return -ENODEV;
++	}
++
++	denoiseAttributeVertex_ = glGetAttribLocation(denoiseProgramId_, "vertexIn");
++	denoiseAttributeTexture_ = glGetAttribLocation(denoiseProgramId_, "textureIn");
++	denoiseUniformTexture_ = glGetUniformLocation(denoiseProgramId_, "tex_rgb");
++	denoiseUniformTexel_ = glGetUniformLocation(denoiseProgramId_, "texel");
++	denoiseUniformSigma_ = glGetUniformLocation(denoiseProgramId_, "sigma");
++	denoiseUniformProjMatrix_ = glGetUniformLocation(denoiseProgramId_, "proj_matrix");
++	denoiseUniformStrideFactor_ = glGetUniformLocation(denoiseProgramId_, "stride_factor");
++
+ 	return 0;
+ }
+ 
+ void DebayerEGL::stop()
+ {
++	eglImageRGB_.reset();
+ 	eglImageBayerOut_.reset();
+ 	eglImageBayerIn_.reset();
+ 
++	if (denoiseProgramId_)
++		glDeleteProgram(denoiseProgramId_);
++	denoiseProgramId_ = 0;
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
+ }
+--- a/src/libcamera/shaders/meson.build
++++ b/src/libcamera/shaders/meson.build
+@@ -6,5 +6,6 @@
+     'bayer_1x_packed.frag',
+     'bayer_unpacked.frag',
+     'bayer_unpacked.vert',
++    'denoise.frag',
+     'identity.vert',
+ ])
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -7,5 +7,6 @@
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'denoise.cpp',
+     'lsc.cpp',
+ ])
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -173,6 +173,7 @@
+ 		params_->gamma = 1.0 / algorithms::kDefaultGamma;
+ 		params_->contrastExp = 1.0;
+ 		params_->gains = { { 1.0, 1.0, 1.0 } };
++		params_->denoiseSigma = 0.0f;
+ 		/* combinedMatrix is reset for each frame. */
+ 	}
+ 
+--- a/src/ipa/simple/data/ov8865.yaml
++++ b/src/ipa/simple/data/ov8865.yaml
+@@ -51,6 +51,11 @@
+       highlightsLow: 0.005
+       highlightsHigh: 0.03
+       highlightsMinTarget: 1.2
++  # edge-preserving noise reduction in the GPU debayer, scaled with the
++  # gain: sigma 2.8 at 1x, 10 at 13x (picked on a textured wall at 13x)
++  - Denoise:
++      sigma: 2.8
++      maxSigma: 16
+   # contrast autofocus on the dw9719 VCM
+   - Af:
+       settleFrames: 2
+--- a/src/ipa/simple/data/ov5693.yaml
++++ b/src/ipa/simple/data/ov5693.yaml
+@@ -39,4 +39,8 @@
+       contrast: 1.4
+   - Agc:
+       target: 1.6
++  # edge-preserving noise reduction, as on the rear camera (untested here)
++  - Denoise:
++      sigma: 2.8
++      maxSigma: 16
+ ...
+--- /dev/null
++++ b/src/libcamera/shaders/denoise.frag
+@@ -0,0 +1,78 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * denoise.frag - Edge-preserving noise reduction on the debayered image
++ *
++ * Second pass after the Bayer shader, on its gamma-encoded RGB. Luma is
++ * smoothed over 3x3 pixels with weights from luma similarity (sigma), so
++ * edges and texture survive. Chroma noise at high gain comes in clumps
++ * larger than that: chroma is averaged over 3x3 taps 4 pixels apart, with a
++ * 3x wider luma tolerance, so colour speckles go but colours don't bleed
++ * across edges.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++uniform sampler2D tex_rgb;
++uniform vec2 texel;		/* 1 / texture size */
++uniform float sigma;		/* output noise, 0..1; 0: pass through */
++varying vec2 textureOut;
++
++float luma(vec3 c)
++{
++	return dot(c, vec3(0.299, 0.587, 0.114));
++}
++
++void main(void)
++{
++	vec3 c = texture2D(tex_rgb, textureOut).rgb;
++	vec3 rgb = c;
++
++	if (sigma > 0.0) {
++		float y = luma(c);
++		float kl = 0.5 / (sigma * sigma);
++		float kc = kl / 9.0;
++		float sumY = 0.0, wY = 0.0;
++		vec2 sumC = vec2(0.0);
++		float wC = 0.0;
++
++		/*
++		 * 3x3 taps each: luma at 1 pixel, chroma 4 pixels apart. A
++		 * rational falloff stands in for exp(-x); 18 reads per pixel
++		 * keep 3264x1836 at the sensor's 20 fps on the Ice Lake GPU.
++		 */
++		for (int dy = -1; dy <= 1; dy++) {
++			for (int dx = -1; dx <= 1; dx++) {
++				vec2 d = vec2(float(dx), float(dy));
++				float ws = 1.0 / (1.0 + 0.5 * dot(d, d));
++
++				float yn = luma(texture2D(tex_rgb, textureOut + d * texel).rgb);
++				float dl = yn - y;
++				float a = ws / (1.0 + kl * dl * dl * (1.0 + kl * dl * dl));
++				sumY += a * yn;
++				wY += a;
++
++				vec3 cn = texture2D(tex_rgb, textureOut + 4.0 * d * texel).rgb;
++				float yc = luma(cn);
++				float dc = yc - y;
++				float b = ws / (1.0 + kc * dc * dc * (1.0 + kc * dc * dc));
++				sumC += b * vec2(cn.b - yc, cn.r - yc);
++				wC += b;
++			}
++		}
++
++		float yo = sumY / wY;
++		vec2 co = sumC / wC;		/* (B - Y, R - Y) */
++		float r = yo + co.y;
++		float b = yo + co.x;
++		float g = (yo - 0.299 * r - 0.114 * b) / 0.587;
++		rgb = clamp(vec3(r, g, b), 0.0, 1.0);
++	}
++
++#if defined(SWAP_BLUE)
++	gl_FragColor = vec4(rgb.bgr, 1.0);
++#else
++	gl_FragColor = vec4(rgb, 1.0);
++#endif
++}
+--- /dev/null
++++ b/src/ipa/simple/algorithms/denoise.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Noise reduction strength for the soft IPA
++ */
++
++#pragma once
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Denoise : public Algorithm
++{
++public:
++	Denoise() = default;
++	~Denoise() = default;
++
++	int init(IPAContext &context, const YamlObject &tuningData) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	double sigma_;
++	double maxSigma_;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+--- /dev/null
++++ b/src/ipa/simple/algorithms/denoise.cpp
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Noise reduction strength for the soft IPA
++ */
++
++#include "denoise.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "simple/ipa_context.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPASoftDenoise)
++
++namespace ipa::soft::algorithms {
++
++/*
++ * The GPU debayer smooths luma and, over a wider area, chroma with weights
++ * from luma similarity, so edges survive; sigma sets how different two
++ * pixels may be and still count as the same surface. Sensor noise in the
++ * gamma-encoded output grows about with the square root of the gain:
++ *
++ *   - Denoise:
++ *       sigma: 2.8       # output noise at unity gain, 8-bit levels
++ *       maxSigma: 16     # cap, beyond which fine texture smears
++ *
++ * Without the algorithm (or with sigma 0) the image is left as it is.
++ */
++int Denoise::init([[maybe_unused]] IPAContext &context, const YamlObject &tuningData)
++{
++	sigma_ = std::max(tuningData["sigma"].get<double>(2.8), 0.0);
++	maxSigma_ = std::max(tuningData["maxSigma"].get<double>(16.0), 0.0);
++
++	LOG(IPASoftDenoise, Debug)
++		<< "sigma " << sigma_ << " at unity gain, max " << maxSigma_;
++	return 0;
++}
++
++void Denoise::prepare(IPAContext &context,
++		      [[maybe_unused]] const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext,
++		      DebayerParams *params)
++{
++	const auto &cfg = context.configuration.agc;
++	const double gainBase = std::max(cfg.againMin, cfg.again10);
++	const double gain = gainBase > 0.0
++				    ? std::max(context.activeState.agc.again / gainBase, 1.0)
++				    : 1.0;
++
++	params->denoiseSigma =
++		static_cast<float>(std::min(sigma_ * std::sqrt(gain), maxSigma_) / 255.0);
++}
++
++REGISTER_IPA_ALGORITHM(Denoise, "Denoise")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */

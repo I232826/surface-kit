@@ -1,0 +1,23 @@
+ov8865: report the sensor clock (SCLK) as pixel rate, not the MIPI output rate
+
+--- a/ov8865.c
++++ b/ov8865.c
+@@ -2304,7 +2304,17 @@
+ 	lanes_count = bus_mipi_csi2->num_data_lanes;
+ 	mipi_pixel_rate = mipi_clk_rate * 2 * lanes_count / bits_per_sample;
+ 
+-	__v4l2_ctrl_s_ctrl_int64(ctrls->pixel_rate, mipi_pixel_rate);
++	/*
++	 * HTS and VTS count in SCLK cycles (144 MHz native, 72 MHz binning,
++	 * see the PLL2 configs), not at the MIPI output rate: with the latter
++	 * libcamera took a line for 10.8 us instead of 27 us, so exposure
++	 * times were 2.5x off and anti-flicker rounded to 25 ms steps.
++	 * Frame timing (3264x1836: 3888 x 1862 at 144 MHz = 19.9 fps) matches
++	 * the measured rate. The IPU takes its rate from the link frequency.
++	 */
++	dev_dbg(sensor->dev, "MIPI pixel rate %lld\n", mipi_pixel_rate);
++	__v4l2_ctrl_s_ctrl_int64(ctrls->pixel_rate,
++				 mode->pll2_binning ? 72000000 : 144000000);
+ 
+ 	return 0;
+ }

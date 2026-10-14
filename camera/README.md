@@ -55,6 +55,18 @@ What makes the rear camera good, and where it lives:
   `scripts/aiqb-dump.py` / `aiqb-to-ccm.py` (Intel AIQB tuning records;
   this SP7 is "Haven": front MSHW0190, rear MSHW0191).
 
+The same build also carries two non-camera kernel fixes:
+
+- `patches/intel-ish-ipc/`: reverts the 6.19 sensor-hub start-up changes
+  (upstream 507561b00ac2, 9e097dc9df80). Without it the ISH never finishes
+  its handshake ("HBM haven't started") and there is no accelerometer, so
+  no auto-rotation (linux-surface#2140).
+- `patches/gpio_keys/0002`: ignores power-button presses for
+  `resume_ignore_ms` (1500, set in `install/surface-kit.conf`) after resume,
+  so the press that woke it or an impatient second press can't put it
+  straight back to sleep. `power/` adds the matching user service that turns
+  the screen off the moment suspend starts.
+
 Install / update:
 
 ```sh

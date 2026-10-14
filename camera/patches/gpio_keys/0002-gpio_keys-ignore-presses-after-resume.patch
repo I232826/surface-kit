@@ -1,0 +1,46 @@
+gpio_keys: ignore key presses for a while after resume
+
+--- a/gpio_keys.c
++++ b/gpio_keys.c
+@@ -39,6 +39,18 @@
+ module_param(wake_key_press, bool, 0644);
+ MODULE_PARM_DESC(wake_key_press, "Report a press for the key that woke the system (default: true)");
+ 
++/*
++ * Right after a resume the power button's own press and release are still
++ * being read (the finger that woke the system), and reach the desktop as a
++ * fresh press: GNOME then suspends again, or logind counts two presses.
++ * Ignore presses for this long after a resume; releases still go through
++ * (the input core drops a release for a key it never saw pressed).
++ */
++static unsigned int resume_ignore_ms;
++module_param(resume_ignore_ms, uint, 0644);
++MODULE_PARM_DESC(resume_ignore_ms, "Ignore key presses for this many ms after a resume (default: 0)");
++static unsigned long last_resume;
++
+ struct gpio_button_data {
+ 	const struct gpio_keys_button *button;
+ 	struct input_dev *input;
+@@ -382,6 +394,13 @@
+ 		return;
+ 	}
+ 
++	if (state && type == EV_KEY && resume_ignore_ms && last_resume &&
++	    time_before(jiffies, last_resume + msecs_to_jiffies(resume_ignore_ms))) {
++		dev_dbg(input->dev.parent, "ignoring press of %u right after resume\n",
++			*bdata->code);
++		return;
++	}
++
+ 	if (type == EV_ABS) {
+ 		if (state)
+ 			input_event(input, type, button->code, button->value);
+@@ -1074,6 +1093,8 @@
+ 	struct input_dev *input = ddata->input;
+ 	int error;
+ 
++	last_resume = jiffies;
++
+ 	if (device_may_wakeup(dev)) {
+ 		gpio_keys_disable_wakeup(ddata);
+ 	} else {

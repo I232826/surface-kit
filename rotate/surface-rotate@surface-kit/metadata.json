@@ -1,0 +1,7 @@
+{
+  "uuid": "surface-rotate@surface-kit",
+  "name": "Surface rotate animation",
+  "description": "Animates auto-rotation: the old screen turns into the new orientation instead of jumping.",
+  "shell-version": ["50"],
+  "version": 1
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Turn the screen off as soon as the system is asked to sleep
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/surface-kit/power/sleep-screen-off.py
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

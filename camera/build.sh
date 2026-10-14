@@ -81,8 +81,26 @@ for src in "${SINGLE_MODS[@]}"; do
     make -C "$KDIR" M="$BUILD/$m" -j"$JOBS" modules
 done
 
+# Sensor hub (accelerometer for auto-rotation, gyro, light): the stock 6.19
+# driver never finishes the Ice Lake ISH start-up handshake; build
+# intel-ish-ipc from drivers/hid/intel-ish-hid with patches/intel-ish-ipc/.
+echo ">> intel-ish-ipc"
+rm -rf "$BUILD/intel-ish-hid"
+cp -r "$KSRC/hid/intel-ish-hid" "$BUILD/intel-ish-hid"
+for p in "$CAM"/patches/intel-ish-ipc/*.patch; do
+    echo ">> applying intel-ish-ipc/$(basename "$p")"
+    patch -d "$BUILD/intel-ish-hid" -p1 --forward --quiet < "$p"
+done
+cat > "$BUILD/intel-ish-hid/Kbuild" <<'KB'
+obj-m += intel-ish-ipc.o
+intel-ish-ipc-objs := ipc/ipc.o ipc/pci-ish.o
+ccflags-y += -I $(src)/ishtp
+KB
+make -C "$KDIR" M="$BUILD/intel-ish-hid" -j"$JOBS" modules
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
+cp "$BUILD/intel-ish-hid/intel-ish-ipc.ko" "$OUT/"
 find "$BUILD/intel" -name '*.ko' -exec cp {} "$OUT/" \;
 for src in "${SINGLE_MODS[@]}"; do
     m="$(basename "$src")"

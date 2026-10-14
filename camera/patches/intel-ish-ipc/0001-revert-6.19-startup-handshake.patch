@@ -1,0 +1,185 @@
+From: surface-kit
+Subject: [PATCH] HID: intel-ish-hid: ipc: revert the 6.19 start-up handshake changes
+
+The Surface Pro 7 (Ice Lake ISH, 8086:34fc) sensor hub never finishes its
+start-up handshake on 6.19 ("HBM haven't started ... ISHTP: Protocol init
+failed"), so the accelerometer, gyro and light sensor are missing and the
+screen can't auto-rotate (linux-surface#2140: fine on <= 6.18.5).
+
+Revert, in reverse order:
+  507561b00ac2 HID: intel-ish-hid: Use IPC RESET instead of void message in ish_wakeup()
+  9e097dc9df80 HID: intel-ish-hid: ipc: Always schedule FW reset work on RESET_NOTIFY/ACK
+
+i.e. go back to waking the bootloader with a void message and waiting for
+the firmware-initiated reset. With this the hub comes up from a cold boot.
+---
+--- a/ipc/ipc.c	2026-10-14 23:16:29.759949153 +0200
++++ b/ipc/ipc.c	2026-10-14 23:16:29.764432023 +0200
+@@ -481,20 +481,6 @@
+ 	return ret;
+ }
+ 
+-static void ish_send_reset_notify_ack(struct ishtp_device *dev)
+-{
+-	/* Read reset ID */
+-	u32 reset_id = ish_reg_read(dev, IPC_REG_ISH2HOST_MSG) & 0xFFFF;
+-
+-	/*
+-	 * Set HOST2ISH.ILUP. Apparently we need this BEFORE sending
+-	 * RESET_NOTIFY_ACK - FW will be checking for it
+-	 */
+-	ish_set_host_rdy(dev);
+-	/* Send RESET_NOTIFY_ACK (with reset_id) */
+-	ipc_send_mng_msg(dev, MNG_RESET_NOTIFY_ACK, &reset_id, sizeof(u32));
+-}
+-
+ #define TIME_SLICE_FOR_FW_RDY_MS		100
+ #define TIME_SLICE_FOR_INPUT_RDY_MS		100
+ #define TIMEOUT_FOR_FW_RDY_MS			2000
+@@ -510,9 +496,13 @@
+  */
+ static int ish_fw_reset_handler(struct ishtp_device *dev)
+ {
++	uint32_t	reset_id;
+ 	unsigned long	flags;
+ 	int ret;
+ 
++	/* Read reset ID */
++	reset_id = ish_reg_read(dev, IPC_REG_ISH2HOST_MSG) & 0xFFFF;
++
+ 	/* Clear IPC output queue */
+ 	spin_lock_irqsave(&dev->wr_processing_spinlock, flags);
+ 	list_splice_init(&dev->wr_processing_list, &dev->wr_free_list);
+@@ -531,6 +521,15 @@
+ 	/* Send clock sync at once after reset */
+ 	ishtp_dev->prev_sync = 0;
+ 
++	/*
++	 * Set HOST2ISH.ILUP. Apparently we need this BEFORE sending
++	 * RESET_NOTIFY_ACK - FW will be checking for it
++	 */
++	ish_set_host_rdy(dev);
++	/* Send RESET_NOTIFY_ACK (with reset_id) */
++	ipc_send_mng_msg(dev, MNG_RESET_NOTIFY_ACK, &reset_id,
++			 sizeof(uint32_t));
++
+ 	/* Wait for ISH FW'es ILUP and ISHTP_READY */
+ 	ret = timed_wait_for_timeout(dev, WAIT_FOR_FW_RDY,
+ 				     TIME_SLICE_FOR_FW_RDY_MS,
+@@ -564,6 +563,8 @@
+ 	if (!rv) {
+ 		/* ISH is ILUP & ISHTP-ready. Restart ISHTP */
+ 		msleep_interruptible(TIMEOUT_FOR_HW_RDY_MS);
++		ishtp_dev->recvd_hw_ready = 1;
++		wake_up_interruptible(&ishtp_dev->wait_hw_ready);
+ 
+ 		/* ISHTP notification in IPC_RESET sequence completion */
+ 		if (!work_pending(work))
+@@ -624,14 +625,15 @@
+ 		break;
+ 
+ 	case MNG_RESET_NOTIFY:
+-		ish_send_reset_notify_ack(ishtp_dev);
+-		fallthrough;
++		if (!ishtp_dev) {
++			ishtp_dev = dev;
++		}
++		queue_work(dev->unbound_wq, &fw_reset_work);
++		break;
+ 
+ 	case MNG_RESET_NOTIFY_ACK:
+ 		dev->recvd_hw_ready = 1;
+ 		wake_up_interruptible(&dev->wait_hw_ready);
+-		if (!work_pending(&fw_reset_work))
+-			queue_work(dev->unbound_wq, &fw_reset_work);
+ 		break;
+ 	}
+ }
+@@ -728,28 +730,22 @@
+  * ish_wakeup() - wakeup ishfw from waiting-for-host state
+  * @dev: ishtp device pointer
+  *
+- * Set the dma enable bit and send a IPC RESET message to FW,
++ * Set the dma enable bit and send a void message to FW,
+  * it wil wakeup FW from waiting-for-host state.
+- *
+- * Return: 0 for success else error code.
+  */
+-static int ish_wakeup(struct ishtp_device *dev)
++static void ish_wakeup(struct ishtp_device *dev)
+ {
+-	int ret;
+-
+ 	/* Set dma enable bit */
+ 	ish_reg_write(dev, IPC_REG_ISH_RMP2, IPC_RMP2_DMA_ENABLED);
+ 
+ 	/*
+-	 * Send IPC RESET message so that ISH FW wakes up if it was already
++	 * Send 0 IPC message so that ISH FW wakes up if it was already
+ 	 * asleep.
+ 	 */
+-	ret = ish_ipc_reset(dev);
++	ish_reg_write(dev, IPC_REG_HOST2ISH_DRBL, IPC_DRBL_BUSY_BIT);
+ 
+ 	/* Flush writes to doorbell and REMAP2 */
+ 	ish_reg_read(dev, IPC_REG_ISH_HOST_FWSTS);
+-
+-	return ret;
+ }
+ 
+ /**
+@@ -798,10 +794,10 @@
+ 	pci_write_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, csr);
+ 
+ 	/* Now we can enable ISH DMA operation and wakeup ISHFW */
+-	return ish_wakeup(dev);
+-}
++	ish_wakeup(dev);
+ 
+-#define RECVD_HW_READY_TIMEOUT (10 * HZ)
++	return	0;
++}
+ 
+ /**
+  * _ish_ipc_reset() - IPC reset
+@@ -837,8 +833,7 @@
+ 	}
+ 
+ 	wait_event_interruptible_timeout(dev->wait_hw_ready,
+-					 dev->recvd_hw_ready,
+-					 RECVD_HW_READY_TIMEOUT);
++					 dev->recvd_hw_ready, 2 * HZ);
+ 	if (!dev->recvd_hw_ready) {
+ 		dev_err(dev->devc, "Timed out waiting for HW ready\n");
+ 		rv = -ENODEV;
+@@ -862,7 +857,21 @@
+ 	set_host_ready(dev);
+ 
+ 	/* After that we can enable ISH DMA operation and wakeup ISHFW */
+-	return ish_wakeup(dev);
++	ish_wakeup(dev);
++
++	/* wait for FW-initiated reset flow */
++	if (!dev->recvd_hw_ready)
++		wait_event_interruptible_timeout(dev->wait_hw_ready,
++						 dev->recvd_hw_ready,
++						 10 * HZ);
++
++	if (!dev->recvd_hw_ready) {
++		dev_err(dev->devc,
++			"[ishtp-ish]: Timed out waiting for FW-initiated reset\n");
++		return	-ENODEV;
++	}
++
++	return 0;
+ }
+ 
+ /**
+@@ -996,7 +1005,6 @@
+ 		list_add_tail(&tx_buf->link, &dev->wr_free_list);
+ 	}
+ 
+-	ishtp_dev = dev;
+ 	ret = devm_work_autocancel(&pdev->dev, &fw_reset_work, fw_reset_work_fn);
+ 	if (ret) {
+ 		dev_err(dev->devc, "Failed to initialise FW reset work\n");

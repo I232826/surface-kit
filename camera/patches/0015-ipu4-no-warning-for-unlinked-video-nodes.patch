@@ -1,0 +1,29 @@
+ipu4: no warning for video nodes that aren't linked yet
+
+--- a/ipu-isys-video.c
++++ b/ipu-isys-video.c
+@@ -440,7 +440,11 @@
+ 		return link->source == pad ? link->sink : link->source;
+ 	}
+ 
+-	WARN_ON(1);
++	/*
++	 * Not linked yet: probe sets up the video nodes' default formats
++	 * before the links exist. Callers handle NULL; a WARN here put 61
++	 * stack traces into every boot's log and tainted the kernel.
++	 */
+ 	return NULL;
+ }
+ 
+@@ -453,10 +457,8 @@
+ 	const u32 *supported_codes;
+ 	const struct ipu_isys_pixelformat *pfmt;
+ 
+-	if (!pad || !pad->entity) {
+-		WARN_ON(1);
++	if (!pad || !pad->entity)
+ 		return NULL;
+-	}
+ 
+ 	sd = media_entity_to_v4l2_subdev(pad->entity);
+ 	supported_codes = to_ipu_isys_subdev(sd)->supported_codes[pad->index];

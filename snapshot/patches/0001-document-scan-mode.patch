@@ -1,5 +1,5 @@
 From: surface-kit
-Subject: Document scanning mode, refocus button
+Subject: Document scanning mode, full-resolution photos, refocus button
 
 A fourth capture mode next to picture, video and QR codes. A photo taken in
 it is turned into a scan of the page in the background: the page is found
@@ -32,12 +32,13 @@ A focus button next to the countdown, and a tap on the picture, ask the
 camera to focus again: they touch $XDG_RUNTIME_DIR/libcamera-af-trigger,
 which the surface-kit libcamera build's autofocus watches.
 
-The camera streams at 1080p at most; in document mode aperture switches
-to the sensor's full resolution with 4:3 preferred (3200x2400 on the
-Surface Pro 7 rear camera), restarting the stream whenever the mode
-changes it (comparing caps missed that: other mode changes had already put
-them on the filter without a restart).
-
+The camera streamed at 1080p at most, and pictures are taken from the
+stream. aperture now has stream profiles: video and QR codes keep 1080p,
+picture mode takes the camera's full width at 16:9 (3200x1800 at 20 fps
+on the Surface Pro 7 rear camera instead of 1920x1080), document mode
+full resolution at 4:3 (3200x2400). Changing mode restarts the stream
+whenever the profile changes (comparing caps missed that: other mode
+changes had already put them on the filter without a restart).
 ---
 --- a/src/main.rs
 +++ b/src/main.rs
@@ -145,17 +146,21 @@ them on the filter without a restart).
                          self.obj().set_shutter_mode(crate::ShutterMode::Picture);
                      }
                      CaptureMode::Video => {
-@@ -103,6 +113,9 @@
+@@ -103,6 +113,13 @@
                  };
                  self.obj()
                      .set_detect_codes(matches!(capture_mode, CaptureMode::QrDetection));
-+                // Pages want every pixel the sensor has.
-+                self.viewfinder
-+                    .set_high_resolution(matches!(capture_mode, CaptureMode::Document));
++                // Pictures are taken from the stream: let it carry every
++                // pixel the sensor has where they end up in a photo.
++                self.viewfinder.set_resolution(match capture_mode {
++                    CaptureMode::Picture => aperture::StreamResolution::Photo,
++                    CaptureMode::Document => aperture::StreamResolution::Document,
++                    CaptureMode::Video | CaptureMode::QrDetection => aperture::StreamResolution::Video,
++                });
  
                  self.obj().notify_capture_mode();
              }
-@@ -134,6 +147,20 @@
+@@ -134,6 +151,20 @@
  
              let obj = self.obj();
  
@@ -176,7 +181,7 @@ them on the filter without a restart).
              let provider = aperture::DeviceProvider::instance();
              self.provider.set(provider.clone()).unwrap();
  
-@@ -526,8 +553,15 @@
+@@ -526,8 +557,15 @@
                  let window = obj.root().and_downcast::<crate::Window>().unwrap();
                  window.set_shutter_enabled(true);
                  // TODO Maybe report error via toast on None
@@ -194,7 +199,7 @@ them on the filter without a restart).
                  }
              }
          ));
-@@ -545,6 +579,122 @@
+@@ -545,6 +583,122 @@
          imp.camera_controls.set_gallery(&gallery);
      }
  
@@ -405,38 +410,62 @@ them on the filter without a restart).
 +    <file preprocess="xml-stripblanks" alias="camera-autofocus-symbolic.svg">icons/camera-autofocus-symbolic.svg</file>
    </gresource>
  </gresources>
+--- a/aperture/src/lib.rs
++++ b/aperture/src/lib.rs
+@@ -35,6 +35,18 @@
+ pub use utils::{is_h264_encoding_supported, is_hardware_encoding_supported};
+ pub use viewfinder::Viewfinder;
+ 
++/// Which stream format the viewfinder asks the camera for.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u8)]
++pub enum StreamResolution {
++    /// At most 1080p, 16:9: the preview, video, QR codes.
++    Video,
++    /// The camera's full width at 16:9: pictures are taken from the stream.
++    Photo,
++    /// Full resolution at 4:3: pages.
++    Document,
++}
++
+ pub(crate) static APP_ID: OnceLock<&'static str> = OnceLock::new();
+ pub(crate) const SUPPORTED_ENCODINGS: [&str; 2] = ["video/x-raw", "image/jpeg"];
+ pub(crate) const PREFERRED_FORMATS: [&str; 5] = ["I420", "BGRx", "RGBx", "xBGR", "xRGB"];
 --- a/aperture/src/utils.rs
 +++ b/aperture/src/utils.rs
-@@ -6,6 +6,16 @@
+@@ -6,6 +6,17 @@
  
  pub(crate) mod caps {
      use std::sync::LazyLock;
-+    use std::sync::atomic::{AtomicBool, Ordering};
++    use std::sync::atomic::{AtomicU8, Ordering};
 +
-+    /// Stream at the camera's full resolution and prefer 4:3 (documents),
-+    /// instead of at most 1080p and 16:9.
-+    static HIGH_RESOLUTION: AtomicBool = AtomicBool::new(false);
++    use crate::StreamResolution;
++
++    // The app starts in picture mode without announcing it
++    static RESOLUTION: AtomicU8 = AtomicU8::new(StreamResolution::Photo as u8);
 +
 +    /// Returns whether the setting changed.
-+    pub(crate) fn set_high_resolution(high: bool) -> bool {
-+        HIGH_RESOLUTION.swap(high, Ordering::Relaxed) != high
++    pub(crate) fn set_resolution(resolution: StreamResolution) -> bool {
++        RESOLUTION.swap(resolution as u8, Ordering::Relaxed) != resolution as u8
 +    }
  
      use super::Size;
  
-@@ -32,8 +42,9 @@
+@@ -32,8 +43,11 @@
      pub(crate) fn best_mode(caps: &gst::Caps) -> Option<Size> {
          const MIN_WIDTH: i32 = 640;
          const MIN_HEIGHT: i32 = 480;
 -        const MAX_HEIGHT: i32 = 1080;
 -        const OPTIMAL_RATIO: f32 = 16.0 / 9.0;
-+        let high = HIGH_RESOLUTION.load(Ordering::Relaxed);
-+        let max_height: i32 = if high { 4096 } else { 1080 };
-+        let optimal_ratio: f32 = if high { 4.0 / 3.0 } else { 16.0 / 9.0 };
++        let (max_height, optimal_ratio): (i32, f32) = match RESOLUTION.load(Ordering::Relaxed) {
++            r if r == StreamResolution::Photo as u8 => (4096, 16.0 / 9.0),
++            r if r == StreamResolution::Document as u8 => (4096, 4.0 / 3.0),
++            _ => (1080, 16.0 / 9.0),
++        };
  
          let mut best_size_optimal_ratio: Option<Size> = None;
          let mut best_size_any_ratio: Option<Size> = None;
-@@ -51,11 +62,11 @@
+@@ -51,11 +65,11 @@
                  best_size_fallback = Some(Size { width, height });
              }
  
@@ -453,15 +482,14 @@ them on the filter without a restart).
                          height: best_h,
 --- a/aperture/src/viewfinder.rs
 +++ b/aperture/src/viewfinder.rs
-@@ -783,6 +783,35 @@
+@@ -783,6 +783,34 @@
          }
      }
  
-+    /// Streams at the camera's full resolution (4:3 preferred) instead of
-+    /// at most 1080p, e.g. for scanning documents. Restarts a running
-+    /// stream with the new format.
-+    pub fn set_high_resolution(&self, high: bool) {
-+        if !crate::utils::caps::set_high_resolution(high) {
++    /// Picks the stream format for what is being captured (see
++    /// [`crate::StreamResolution`]). Restarts a running stream with it.
++    pub fn set_resolution(&self, resolution: crate::StreamResolution) {
++        if !crate::utils::caps::set_resolution(resolution) {
 +            return;
 +        }
 +
@@ -476,7 +504,7 @@ them on the filter without a restart).
 +        // Not only Playing: while previewing camerabin can report Paused
 +        // (or sit in a locked state), and the new format must still apply.
 +        let running = !matches!(imp.camerabin().current_state(), gst::State::Null);
-+        log::debug!("High resolution {high}, restarting the stream: {running}");
++        log::debug!("Stream resolution {resolution:?}, restarting the stream: {running}");
 +        if running {
 +            self.stop_stream();
 +        }

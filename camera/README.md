@@ -31,3 +31,41 @@ camera/build.sh        # -> camera/out/$(uname -r)/*.ko
 
 Needs `build-essential` and `linux-headers-$(uname -r)`. The kernel was built
 with gcc 11, we build with gcc 15 (kbuild warns; expected).
+
+## Status (2026-10-14)
+
+| Camera | State |
+|--------|-------|
+| Rear ov8865 (8 MP, autofocus) | **Works.** 3264x1836/1920x1080 at 20 fps in GNOME Camera; autofocus, white balance, colour, denoise. |
+| Front ov5693 (5 MP) | **Parked: no.** Its CSI-2 link locks only now and then and degrades with use. Sensor registers, link rate and every receiver setting were swept, and the Windows driver's tables (`camera/windows/`) match ours, so no software difference is left to find; likely the module or its cable. |
+| IR ov7251 | Never probes (`skip_fw_ports=6`). |
+
+What makes the rear camera good, and where it lives:
+
+- Kernel: IPU4P stack with our fixes (`patches/0001`-`0014`), ov8865
+  (`patches/ov8865/`: mode registers on stream start, mirror fix, vblank
+  reset, fine gain steps, 20 fps 1836 mode, SCLK pixel rate), dw9719 lens
+  (`patches/dw9719/`).
+- libcamera 0.7.0 rebuilt as .debs (`libcamera/patches/0001`-`0016`):
+  SoftISP fixes, AGC (anti-flicker, proportional, highlight damping),
+  sensor delays, contrast autofocus (fine sweep, approach from below,
+  wobble tolerance, parked start), grey-locus AWB and colour matrices from
+  the Windows calibration, lens shading, denoise pass, tuning files.
+- Windows driver data: `scripts/win-regtables.py` (sensor register tables),
+  `scripts/aiqb-dump.py` / `aiqb-to-ccm.py` (Intel AIQB tuning records;
+  this SP7 is "Haven": front MSHW0190, rear MSHW0191).
+
+Install / update:
+
+```sh
+camera/build.sh && sudo camera/install/install.sh      # modules; reboot after
+libcamera/build-deb.sh                                  # prints the install
+# commands; stop PipeWire while installing the .debs (an old PipeWire that
+# loads the new IPA module hangs), then start it again
+```
+
+Test tools: `scripts/focus-raw-sweep.py` (raw sharpness per lens position,
+ground truth for autofocus), `scripts/awb-eval.py` (white balance methods
+against a white-paper reference), `scripts/settle-sweep.sh` (front link
+sweeps), `scripts/denoise-proto.py`. Sweeps and raw tests need PipeWire
+stopped and GNOME Camera closed.

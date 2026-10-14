@@ -1,0 +1,12 @@
+[package]
+name = "doctest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+gtk = { path = "gtk-shim" }
+log = "0.4"
+
+[profile.release]
+debug = false

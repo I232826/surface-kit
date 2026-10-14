@@ -8,3 +8,4 @@ libcamera/.work-*/
 camera/logs/
 __pycache__/
 camera/out-known-good-*/
+snapshot/doctest/target/

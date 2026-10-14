@@ -1,0 +1,1268 @@
+From: surface-kit
+Subject: Document scanning mode
+
+A fourth capture mode next to picture, video and QR codes. A photo taken in
+it is turned into a scan of the page in the background: the page is found
+(masks of the brightest area at several thresholds, of the paper's colour
+at any brightness so shadows stay on the page, and of colours rare along
+the border; of the outlines that are mostly filled and have real edges
+the largest wins),
+its four corners taken from the convex hull. A dialog shows the photo
+with that outline and a handle on each corner to drag (a page on other
+white paper has no edge to find); without a page it starts just inside
+the frame. Save warps the page to an upright rectangle and evens out the
+paper per colour channel to neutral white; the photo stays next to the
+scan. Plain Rust and cairo, no new crates.
+
+The camera streams at 1080p at most; in document mode aperture switches
+to the sensor's full resolution with 4:3 preferred (3200x2400 on the
+Surface Pro 7 rear camera), restarting a running stream.
+
+---
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,6 +2,8 @@
+ #[rustfmt::skip]
+ mod config;
+ mod application;
++mod document;
++mod scan_adjust;
+ mod enums;
+ mod utils;
+ mod widgets;
+--- a/src/enums.rs
++++ b/src/enums.rs
+@@ -48,6 +48,7 @@
+     Picture,
+     Video,
+     QrDetection,
++    Document,
+ }
+ 
+ impl From<i32> for CaptureMode {
+@@ -56,6 +57,7 @@
+             0 => Self::Picture,
+             1 => Self::Video,
+             2 => Self::QrDetection,
++            3 => Self::Document,
+             _ => Self::default(),
+         }
+     }
+--- a/src/widgets/window.rs
++++ b/src/widgets/window.rs
+@@ -73,7 +73,9 @@
+             self.camera.stop_stream();
+ 
+             match obj.capture_mode() {
+-                CaptureMode::Picture => obj.set_shutter_mode(crate::ShutterMode::Picture),
++                CaptureMode::Picture | CaptureMode::Document => {
++                    obj.set_shutter_mode(crate::ShutterMode::Picture)
++                }
+                 CaptureMode::Video => obj.set_shutter_mode(crate::ShutterMode::Video),
+                 CaptureMode::QrDetection => (),
+             }
+@@ -102,7 +104,7 @@
+             klass.install_action_async("win.take-picture", None, async |window, _, _| {
+                 if let Err(err) = window.on_take_picture().await {
+                     match window.capture_mode() {
+-                        CaptureMode::Picture => {
++                        CaptureMode::Picture | CaptureMode::Document => {
+                             log::error!("Could not take picture: {err}");
+                             window.send_toast(&gettext("Could not take picture"));
+                         }
+@@ -358,7 +360,7 @@
+                         async move {
+                             if let Err(err) = window.shutter_action().await {
+                                 match window.capture_mode() {
+-                                    CaptureMode::Picture => {
++                                    CaptureMode::Picture | CaptureMode::Document => {
+                                         log::error!("Could not take picture: {err}");
+                                         window.send_toast(&gettext("Could not take picture"));
+                                     }
+--- a/src/widgets/camera.rs
++++ b/src/widgets/camera.rs
+@@ -93,7 +93,7 @@
+         fn set_capture_mode(&self, capture_mode: crate::CaptureMode) {
+             if capture_mode != self.capture_mode.replace(capture_mode) {
+                 match capture_mode {
+-                    CaptureMode::Picture => {
++                    CaptureMode::Picture | CaptureMode::Document => {
+                         self.obj().set_shutter_mode(crate::ShutterMode::Picture);
+                     }
+                     CaptureMode::Video => {
+@@ -103,6 +103,9 @@
+                 };
+                 self.obj()
+                     .set_detect_codes(matches!(capture_mode, CaptureMode::QrDetection));
++                // Pages want every pixel the sensor has.
++                self.viewfinder
++                    .set_high_resolution(matches!(capture_mode, CaptureMode::Document));
+ 
+                 self.obj().notify_capture_mode();
+             }
+@@ -526,8 +529,15 @@
+                 let window = obj.root().and_downcast::<crate::Window>().unwrap();
+                 window.set_shutter_enabled(true);
+                 // TODO Maybe report error via toast on None
+-                if let Some(file) = file {
+-                    gallery.add_image(file);
++                let Some(file) = file else {
++                    return;
++                };
++                let path = file.path();
++                match (obj.capture_mode(), path) {
++                    (crate::CaptureMode::Document, Some(path)) => {
++                        obj.scan_document(&gallery, &window, path)
++                    }
++                    _ => gallery.add_image(file),
+                 }
+             }
+         ));
+@@ -545,6 +555,54 @@
+         imp.camera_controls.set_gallery(&gallery);
+     }
+ 
++    /// Turns a photo just taken in document mode into a scan of the page:
++    /// finds the page off the main thread, lets the user adjust its corners
++    /// and saves the scan next to the photo, which stays.
++    fn scan_document(&self, gallery: &crate::Gallery, window: &crate::Window, photo: std::path::PathBuf) {
++        glib::spawn_future_local(glib::clone!(
++            #[weak]
++            gallery,
++            #[weak]
++            window,
++            async move {
++                gallery.add_image(&gio::File::for_path(&photo));
++
++                let input = photo.clone();
++                let prep = match gio::spawn_blocking(move || crate::document::prepare(&input)).await {
++                    Ok(Ok(prep)) => prep,
++                    Ok(Err(err)) => {
++                        log::error!("Could not open {} for scanning: {err}", photo.display());
++                        window.send_toast(&gettext("Could not scan the page"));
++                        return;
++                    }
++                    Err(_) => {
++                        log::error!("Document scan thread panicked");
++                        return;
++                    }
++                };
++
++                let Some(corners) = crate::scan_adjust::adjust_corners(&window, &prep).await else {
++                    return;
++                };
++
++                let out = crate::document::scan_path(&photo);
++                let target = out.clone();
++                let saved = gio::spawn_blocking(move || {
++                    crate::document::save_scan(&prep, &corners, &target)
++                })
++                .await;
++                match saved {
++                    Ok(Ok(())) => gallery.add_image(&gio::File::for_path(out)),
++                    Ok(Err(err)) => {
++                        log::error!("Could not save {}: {err}", out.display());
++                        window.send_toast(&gettext("Could not save the scan"));
++                    }
++                    Err(_) => log::error!("Document scan thread panicked"),
++                }
++            }
++        ));
++    }
++
+     pub fn stop_stream(&self) {
+         self.imp().viewfinder.stop_stream();
+     }
+--- a/data/org.gnome.Snapshot.gschema.xml.in
++++ b/data/org.gnome.Snapshot.gschema.xml.in
+@@ -4,6 +4,7 @@
+     <value nick="picture" value="0" />
+     <value nick="video" value="1" />
+     <value nick="qr-detection" value="2" />
++    <value nick="document" value="3" />
+   </enum>
+   <enum id="org.gnome.Snapshot.PictureFormat">
+     <value nick="jpeg" value="0" />
+--- a/data/resources/ui/camera.ui
++++ b/data/resources/ui/camera.ui
+@@ -178,6 +178,13 @@
+                                     <property name="name">qr-code</property>
+                                   </object>
+                                 </child>
++                                <child>
++                                  <object class="AdwToggle">
++                                    <property name="icon-name">x-office-document-symbolic</property>
++                                    <property name="tooltip" translatable="yes">Document Scanning Mode</property>
++                                    <property name="name">document</property>
++                                  </object>
++                                </child>
+                               </object>
+                             </child>
+                             <child>
+--- a/aperture/src/utils.rs
++++ b/aperture/src/utils.rs
+@@ -6,6 +6,15 @@
+ 
+ pub(crate) mod caps {
+     use std::sync::LazyLock;
++    use std::sync::atomic::{AtomicBool, Ordering};
++
++    /// Stream at the camera's full resolution and prefer 4:3 (documents),
++    /// instead of at most 1080p and 16:9.
++    static HIGH_RESOLUTION: AtomicBool = AtomicBool::new(false);
++
++    pub(crate) fn set_high_resolution(high: bool) {
++        HIGH_RESOLUTION.store(high, Ordering::Relaxed);
++    }
+ 
+     use super::Size;
+ 
+@@ -32,8 +41,9 @@
+     pub(crate) fn best_mode(caps: &gst::Caps) -> Option<Size> {
+         const MIN_WIDTH: i32 = 640;
+         const MIN_HEIGHT: i32 = 480;
+-        const MAX_HEIGHT: i32 = 1080;
+-        const OPTIMAL_RATIO: f32 = 16.0 / 9.0;
++        let high = HIGH_RESOLUTION.load(Ordering::Relaxed);
++        let max_height: i32 = if high { 4096 } else { 1080 };
++        let optimal_ratio: f32 = if high { 4.0 / 3.0 } else { 16.0 / 9.0 };
+ 
+         let mut best_size_optimal_ratio: Option<Size> = None;
+         let mut best_size_any_ratio: Option<Size> = None;
+@@ -51,11 +61,11 @@
+                 best_size_fallback = Some(Size { width, height });
+             }
+ 
+-            let max_width = (height as f32 * OPTIMAL_RATIO).ceil() as i32;
++            let max_width = (height as f32 * optimal_ratio).ceil() as i32;
+             if (MIN_WIDTH..=max_width).contains(&width)
+-                && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height)
++                && (MIN_HEIGHT..=max_height).contains(&height)
+             {
+-                if width == (height as f32 * OPTIMAL_RATIO) as i32 {
++                if width == (height as f32 * optimal_ratio) as i32 {
+                     if let Some(Size {
+                         width: best_w,
+                         height: best_h,
+--- a/aperture/src/viewfinder.rs
++++ b/aperture/src/viewfinder.rs
+@@ -783,6 +783,30 @@
+         }
+     }
+ 
++    /// Streams at the camera's full resolution (4:3 preferred) instead of
++    /// at most 1080p, e.g. for scanning documents. Restarts a running
++    /// stream with the new format.
++    pub fn set_high_resolution(&self, high: bool) {
++        crate::utils::caps::set_high_resolution(high);
++
++        let imp = self.imp();
++        let (Some(camera), Some(capsfilter)) = (self.camera(), imp.capsfilter.get()) else {
++            return;
++        };
++        let caps = camera.best_caps();
++        if capsfilter.property::<gst::Caps>("caps") == caps {
++            return;
++        }
++        let running = matches!(imp.camerabin().current_state(), gst::State::Playing);
++        if running {
++            self.stop_stream();
++        }
++        capsfilter.set_property("caps", &caps);
++        if running {
++            self.start_stream();
++        }
++    }
++
+     /// Stops the viewfinder.
+     ///
+     /// A black frame will be shown after this methods has been called.
+--- /dev/null
++++ b/src/document.rs
+@@ -0,0 +1,721 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Document scans: find the page in a photo, straighten it and even out the
++//! paper, without any image processing library.
++//!
++//! The page is told from its surroundings by colour: the outer border of the
++//! photo mostly shows the background (a desk, cloth), so colours common there
++//! count as background and the largest connected area of other colours is the
++//! page. Its outline is reduced to the four corners enclosing the most area,
++//! which works at any rotation. A perspective warp makes the page a
++//! rectangle, and dividing by a smooth estimate of the paper brightness
++//! removes shadows and vignetting so the paper comes out white.
++
++use std::collections::VecDeque;
++use std::path::{Path, PathBuf};
++
++use anyhow::Context;
++use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
++
++/// Long side of the image the page is searched in.
++const DETECT_SIZE: usize = 480;
++/// Smallest page, as a share of the photo.
++const MIN_PAGE_AREA: f64 = 0.08;
++
++struct Rgb {
++    w: usize,
++    h: usize,
++    data: Vec<u8>, // RGB, 3 bytes per pixel, no padding
++}
++
++impl Rgb {
++    fn px(&self, x: usize, y: usize) -> [u8; 3] {
++        let i = 3 * (y * self.w + x);
++        [self.data[i], self.data[i + 1], self.data[i + 2]]
++    }
++}
++
++pub type Point = (f64, f64);
++
++/// Long side of the preview the corners are adjusted on.
++const PREVIEW_SIZE: usize = 1600;
++
++/// A photo loaded for scanning: the page corners found in it (or an outline
++/// just inside the frame), and a small preview to adjust them on.
++pub struct Prepared {
++    photo: Rgb,
++    pub width: usize,
++    pub height: usize,
++    pub corners: [Point; 4],
++    pub detected: bool,
++    pub preview: Preview,
++}
++
++/// Cairo ARGB32 pixels (B, G, R, A in memory, opaque).
++pub struct Preview {
++    pub width: usize,
++    pub height: usize,
++    pub argb: Vec<u8>,
++}
++
++/// Loads the photo and looks for the page. Runs off the main thread.
++pub fn prepare(photo: &Path) -> anyhow::Result<Prepared> {
++    let img = load(photo)?;
++    let small = downscale(&img, DETECT_SIZE);
++    let s = img.w as f64 / small.w as f64;
++    let found = find_page(&small).map(|c| c.map(|(x, y)| ((x + 0.5) * s, (y + 0.5) * s)));
++    let (w, h) = (img.w as f64, img.h as f64);
++    let inset = [(0.1 * w, 0.1 * h), (0.9 * w, 0.1 * h), (0.9 * w, 0.9 * h), (0.1 * w, 0.9 * h)];
++
++    let p = downscale(&img, PREVIEW_SIZE);
++    let mut argb = Vec::with_capacity(p.w * p.h * 4);
++    for px in p.data.chunks_exact(3) {
++        argb.extend_from_slice(&[px[2], px[1], px[0], 255]);
++    }
++
++    Ok(Prepared {
++        width: img.w,
++        height: img.h,
++        corners: found.unwrap_or(inset),
++        detected: found.is_some(),
++        preview: Preview {
++            width: p.w,
++            height: p.h,
++            argb,
++        },
++        photo: img,
++    })
++}
++
++/// Straightens and evens out the page within `corners` (photo pixels, any
++/// order) and saves it to `out`. Runs off the main thread.
++pub fn save_scan(prep: &Prepared, corners: &[Point; 4], out: &Path) -> anyhow::Result<()> {
++    let mut page = warp(&prep.photo, &order_corners(*corners));
++    whiten(&mut page);
++    save_jpeg(&page, out)
++}
++
++/// Turns the photo at `photo` into a scan next to it without asking.
++/// Returns the scan's path, or an error if no page was found.
++#[allow(dead_code)]
++pub fn scan(photo: &Path) -> anyhow::Result<PathBuf> {
++    let prep = prepare(photo)?;
++    anyhow::ensure!(prep.detected, "No page found");
++    let out = scan_path(photo);
++    save_scan(&prep, &prep.corners, &out)?;
++    Ok(out)
++}
++
++/// Where the scan of `photo` goes: next to it.
++pub fn scan_path(photo: &Path) -> PathBuf {
++    let stem = photo
++        .file_stem()
++        .map(|s| s.to_string_lossy().into_owned())
++        .unwrap_or_else(|| "photo".into());
++    photo.with_file_name(format!("{stem} (scan).jpeg"))
++}
++
++fn load(path: &Path) -> anyhow::Result<Rgb> {
++    let pb = Pixbuf::from_file(path)?;
++    let pb = pb.apply_embedded_orientation().unwrap_or(pb);
++    let (w, h) = (pb.width() as usize, pb.height() as usize);
++    let n = pb.n_channels() as usize;
++    let stride = pb.rowstride() as usize;
++    let bytes = pb.read_pixel_bytes();
++    let mut data = Vec::with_capacity(w * h * 3);
++    for y in 0..h {
++        let row = &bytes[y * stride..];
++        for x in 0..w {
++            data.extend_from_slice(&row[x * n..x * n + 3]);
++        }
++    }
++    Ok(Rgb { w, h, data })
++}
++
++fn save_jpeg(img: &Rgb, path: &Path) -> anyhow::Result<()> {
++    let bytes = gtk::glib::Bytes::from(&img.data[..]);
++    let pb = Pixbuf::from_bytes(
++        &bytes,
++        Colorspace::Rgb,
++        false,
++        8,
++        img.w as i32,
++        img.h as i32,
++        (img.w * 3) as i32,
++    );
++    pb.savev(path, "jpeg", &[("quality", "92")])?;
++    Ok(())
++}
++
++/// Box-filtered copy whose long side is at most `max` pixels.
++fn downscale(img: &Rgb, max: usize) -> Rgb {
++    let f = img.w.max(img.h).div_ceil(max).max(1);
++    let (w, h) = (img.w / f, img.h / f);
++    let mut data = Vec::with_capacity(w * h * 3);
++    for y in 0..h {
++        for x in 0..w {
++            let mut sum = [0u32; 3];
++            for yy in y * f..(y + 1) * f {
++                for xx in x * f..(x + 1) * f {
++                    let p = img.px(xx, yy);
++                    for c in 0..3 {
++                        sum[c] += p[c] as u32;
++                    }
++                }
++            }
++            let n = (f * f) as u32;
++            data.extend(sum.iter().map(|s| (s / n) as u8));
++        }
++    }
++    Rgb { w, h, data }
++}
++
++/// Coarse colour bin: 3 bits per channel.
++fn bin(p: [u8; 3]) -> usize {
++    ((p[0] as usize >> 5) << 6) | ((p[1] as usize >> 5) << 3) | (p[2] as usize >> 5)
++}
++
++fn find_page(img: &Rgb) -> Option<[Point; 4]> {
++    if img.w < 16 || img.h < 16 {
++        return None;
++    }
++    let (w, h) = (img.w, img.h);
++    let luma: Vec<u8> = (0..w * h)
++        .map(|i| {
++            let p = img.px(i % w, i / w);
++            ((p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29) >> 8) as u8
++        })
++        .collect();
++
++    // Candidate page masks. Paper is usually the brightest large area, but
++    // light falling across the page leaves part of it below Otsu's
++    // threshold, so lower thresholds are tried too. A shadow darkens paper
++    // without changing its colour, so masks of "the colour of the brightest
++    // pixels, at any brightness" are tried as well; a red cloth or a blue
++    // folder differs in colour, not just brightness.
++    let mut masks: Vec<(String, Vec<bool>)> = Vec::new();
++    let t1 = otsu(&luma, 255);
++    let t2 = otsu(&luma, t1);
++    for k in 0..=4u16 {
++        let t = (t1 as u16 - (t1 as u16 - t2.min(t1) as u16) * k / 4) as u8;
++        masks.push((format!("luma > {t}"), luma.iter().map(|&l| l > t).collect()));
++    }
++    if let Some((pr, pg, paper_luma)) = paper_colour(img, &luma) {
++        let floor = (paper_luma * 0.12).max(16.0);
++        for tol in [0.02, 0.035, 0.05] {
++            let mask = (0..w * h)
++                .map(|i| {
++                    let p = img.px(i % w, i / w);
++                    let s = p[0] as f64 + p[1] as f64 + p[2] as f64;
++                    luma[i] as f64 > floor
++                        && ((p[0] as f64 / s - pr).powi(2) + (p[1] as f64 / s - pg).powi(2)).sqrt()
++                            < tol
++                })
++                .collect();
++            masks.push((format!("paper colour within {tol}"), mask));
++        }
++    }
++    masks.push(("colours rare on the border".into(), border_colour_mask(img)));
++
++    // Of the outlines that are mostly filled (one reaching over the desk is
++    // mostly empty) and have real edges (at least half the sharpest step
++    // found; a cut through the page has none), take the largest: a sharp
++    // shadow edge inside the page must not win over the page's own edge.
++    let mut found: Vec<([Point; 4], f64, f64)> = Vec::new();
++    for (name, mask) in &masks {
++        let Some((quad, area, fill)) = page_from_mask(mask, w, h) else {
++            continue;
++        };
++        let contrast = edge_contrast(&luma, w, h, &quad);
++        log::debug!(
++            "{name}: fill {fill:.2} contrast {contrast:.1} area {:.0}% quad {:?}",
++            100.0 * area / (w * h) as f64,
++            quad.map(|(x, y)| (x as i32, y as i32))
++        );
++        if fill >= 0.75 {
++            found.push((quad, area, contrast));
++        }
++    }
++    let sharpest = found.iter().map(|f| f.2).fold(0.0, f64::max);
++    found
++        .into_iter()
++        .filter(|f| f.2 >= 0.5 * sharpest)
++        .max_by(|a, b| a.1.total_cmp(&b.1))
++        .map(|f| f.0)
++}
++
++/// Chromaticity (r, g share of r + g + b) and luma of the paper, taken
++/// from the brightest 10% of the pixels.
++fn paper_colour(img: &Rgb, luma: &[u8]) -> Option<(f64, f64, f64)> {
++    let mut sorted = luma.to_vec();
++    sorted.sort_unstable();
++    let cut = sorted[sorted.len() * 9 / 10];
++    let (mut r, mut g, mut s, mut l, mut n) = (0.0, 0.0, 0.0, 0.0, 0.0);
++    for (i, &li) in luma.iter().enumerate() {
++        if li >= cut && li < 250 {
++            let p = img.px(i % img.w, i / img.w);
++            r += p[0] as f64;
++            g += p[1] as f64;
++            s += p[0] as f64 + p[1] as f64 + p[2] as f64;
++            l += li as f64;
++            n += 1.0;
++        }
++    }
++    (n > 0.0 && s > 0.0).then(|| (r / s, g / s, l / n))
++}
++
++/// Luma step across the quad's sides, inside minus outside, averaged over
++/// the whole perimeter. Each sample takes the strongest step over 2-6
++/// pixels either way, so a side a few pixels off the real edge still finds
++/// it. Sides along the photo's own edge show no step and count as 0, so an
++/// outline is not favoured for leaning on the photo's edge.
++fn edge_contrast(luma: &[u8], w: usize, h: usize, q: &[Point; 4]) -> f64 {
++    let cx = q.iter().map(|p| p.0).sum::<f64>() / 4.0;
++    let cy = q.iter().map(|p| p.1).sum::<f64>() / 4.0;
++    let on_border = |p: Point| {
++        (p.0 < 4.0, p.0 > w as f64 - 5.0, p.1 < 4.0, p.1 > h as f64 - 5.0)
++    };
++    let at = |x: f64, y: f64| -> Option<f64> {
++        let (xi, yi) = (x.round() as i64, y.round() as i64);
++        (xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h)
++            .then(|| luma[yi as usize * w + xi as usize] as f64)
++    };
++    let (mut sum, mut perimeter) = (0.0, 0.0);
++    for i in 0..4 {
++        let (a, b) = (q[i], q[(i + 1) % 4]);
++        let len = dist(a, b).max(1.0);
++        perimeter += len;
++        let (ba, bb) = (on_border(a), on_border(b));
++        if (ba.0 && bb.0) || (ba.1 && bb.1) || (ba.2 && bb.2) || (ba.3 && bb.3) {
++            continue;
++        }
++        let (mut nx, mut ny) = (-(b.1 - a.1) / len, (b.0 - a.0) / len);
++        let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
++        if nx * (cx - mx) + ny * (cy - my) < 0.0 {
++            (nx, ny) = (-nx, -ny); // point inwards
++        }
++        let (mut side, mut n) = (0.0, 0u32);
++        for s in 1..40 {
++            let f = s as f64 / 40.0;
++            let (x, y) = (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f);
++            let mut step = 0.0f64;
++            for shift in -3..=3 {
++                let (sx, sy) = (x + shift as f64 * nx, y + shift as f64 * ny);
++                if let (Some(i), Some(o)) = (at(sx + 2.0 * nx, sy + 2.0 * ny), at(sx - 2.0 * nx, sy - 2.0 * ny)) {
++                    step = step.max(i - o);
++                }
++            }
++            side += step;
++            n += 1;
++        }
++        sum += side / n.max(1) as f64 * len;
++    }
++    sum / perimeter
++}
++
++/// Otsu's threshold over the values up to `max`.
++fn otsu(luma: &[u8], max: u8) -> u8 {
++    let mut hist = [0f64; 256];
++    for &l in luma.iter().filter(|&&l| l <= max) {
++        hist[l as usize] += 1.0;
++    }
++    let total: f64 = hist.iter().sum();
++    let sum: f64 = hist.iter().enumerate().map(|(i, n)| i as f64 * n).sum();
++    let (mut w0, mut sum0, mut best, mut threshold) = (0.0, 0.0, 0.0, 0u8);
++    for (t, &n) in hist.iter().enumerate() {
++        w0 += n;
++        sum0 += t as f64 * n;
++        let w1 = total - w0;
++        if w0 == 0.0 || w1 == 0.0 {
++            continue;
++        }
++        let between = w0 * w1 * (sum0 / w0 - (sum - sum0) / w1).powi(2);
++        if between > best {
++            best = between;
++            threshold = t as u8;
++        }
++    }
++    threshold
++}
++
++/// Pixels whose colour is rare along the photo's border.
++fn border_colour_mask(img: &Rgb) -> Vec<bool> {
++    let (w, h) = (img.w, img.h);
++
++    // Colours of the outer border, 4% deep: the background.
++    let bw = (w.min(h) / 25).max(2);
++    let mut hist = [0u32; 512];
++    let mut border = 0u32;
++    for y in 0..h {
++        for x in 0..w {
++            if x < bw || y < bw || x >= w - bw || y >= h - bw {
++                hist[bin(img.px(x, y))] += 1;
++                border += 1;
++            }
++        }
++    }
++    // A colour (or its neighbour bins) covering >0.5% of the border is
++    // background; the neighbours absorb shading across bin edges.
++    let common = |b: usize| hist[b] as f64 > 0.005 * border as f64;
++    let mut background = [false; 512];
++    for (b, bg) in background.iter_mut().enumerate() {
++        let (r, g, bl) = ((b >> 6) as i32, ((b >> 3) & 7) as i32, (b & 7) as i32);
++        'n: for dr in -1..=1 {
++            for dg in -1..=1 {
++                for db in -1..=1 {
++                    let (r2, g2, b2) = (r + dr, g + dg, bl + db);
++                    if (0..8).contains(&r2) && (0..8).contains(&g2) && (0..8).contains(&b2) {
++                        let n = ((r2 << 6) | (g2 << 3) | b2) as usize;
++                        if hist[n] as f64 > 0.02 * border as f64
++                            || (dr == 0 && dg == 0 && db == 0 && common(n))
++                        {
++                            *bg = true;
++                            break 'n;
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    (0..w * h)
++        .map(|i| !background[bin(img.px(i % w, i / w))])
++        .collect()
++}
++
++/// The page's corners from a mask of page pixels, with the quad's area and
++/// the share of it the mask fills.
++fn page_from_mask(mask: &[bool], w: usize, h: usize) -> Option<([Point; 4], f64, f64)> {
++    let mut fg = mask.to_vec();
++    fg = morph(&fg, w, h, false); // open: drop specks
++    fg = morph(&fg, w, h, true);
++    fg = morph(&fg, w, h, true); // close: bridge text and lines on the page
++    fg = morph(&fg, w, h, false);
++
++    let blob = largest_component(&fg, w, h)?;
++    if (blob.len() as f64) < MIN_PAGE_AREA * (w * h) as f64 {
++        return None;
++    }
++
++    let hull = convex_hull(blob);
++    let quad = reduce_to_quad(hull)?;
++    let area = polygon_area(&quad);
++    if area < MIN_PAGE_AREA * (w * h) as f64 {
++        return None;
++    }
++    let quad = order_corners(quad);
++    let fill = fill_ratio(&fg, w, h, &quad);
++    Some((quad, area, fill))
++}
++
++/// Share of the pixels inside the convex quad that are set in the mask.
++fn fill_ratio(m: &[bool], w: usize, h: usize, q: &[Point; 4]) -> f64 {
++    let inside = |x: f64, y: f64| {
++        let mut sign = 0.0f64;
++        for i in 0..4 {
++            let (a, b) = (q[i], q[(i + 1) % 4]);
++            let c = (b.0 - a.0) * (y - a.1) - (b.1 - a.1) * (x - a.0);
++            if c != 0.0 {
++                if sign != 0.0 && c.signum() != sign {
++                    return false;
++                }
++                sign = c.signum();
++            }
++        }
++        true
++    };
++    let (mut n, mut set) = (0u32, 0u32);
++    for y in 0..h {
++        for x in 0..w {
++            if inside(x as f64, y as f64) {
++                n += 1;
++                set += m[y * w + x] as u32;
++            }
++        }
++    }
++    if n == 0 { 0.0 } else { set as f64 / n as f64 }
++}
++
++/// 3x3 dilation (`grow`) or erosion of a mask.
++fn morph(m: &[bool], w: usize, h: usize, grow: bool) -> Vec<bool> {
++    let mut out = vec![false; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            let mut v = !grow;
++            for dy in -1i32..=1 {
++                for dx in -1i32..=1 {
++                    let (xx, yy) = (x as i32 + dx, y as i32 + dy);
++                    let s = if xx < 0 || yy < 0 || xx >= w as i32 || yy >= h as i32 {
++                        false
++                    } else {
++                        m[yy as usize * w + xx as usize]
++                    };
++                    if grow {
++                        v |= s;
++                    } else {
++                        v &= s;
++                    }
++                }
++            }
++            out[y * w + x] = v;
++        }
++    }
++    out
++}
++
++/// Pixels of the largest 4-connected area of the mask.
++fn largest_component(m: &[bool], w: usize, h: usize) -> Option<Vec<(i32, i32)>> {
++    let mut seen = vec![false; w * h];
++    let mut best: Vec<(i32, i32)> = Vec::new();
++    let mut queue = VecDeque::new();
++    for start in 0..w * h {
++        if !m[start] || seen[start] {
++            continue;
++        }
++        let mut blob = Vec::new();
++        seen[start] = true;
++        queue.push_back(start);
++        while let Some(i) = queue.pop_front() {
++            let (x, y) = (i % w, i / w);
++            blob.push((x as i32, y as i32));
++            let mut visit = |j: usize| {
++                if m[j] && !seen[j] {
++                    seen[j] = true;
++                    queue.push_back(j);
++                }
++            };
++            if x > 0 {
++                visit(i - 1);
++            }
++            if x + 1 < w {
++                visit(i + 1);
++            }
++            if y > 0 {
++                visit(i - w);
++            }
++            if y + 1 < h {
++                visit(i + w);
++            }
++        }
++        if blob.len() > best.len() {
++            best = blob;
++        }
++    }
++    (!best.is_empty()).then_some(best)
++}
++
++/// Convex hull (Andrew's monotone chain), counter-clockwise.
++fn convex_hull(mut pts: Vec<(i32, i32)>) -> Vec<Point> {
++    pts.sort_unstable();
++    pts.dedup();
++    let cross = |o: (i32, i32), a: (i32, i32), b: (i32, i32)| -> i64 {
++        (a.0 - o.0) as i64 * (b.1 - o.1) as i64 - (a.1 - o.1) as i64 * (b.0 - o.0) as i64
++    };
++    let mut hull: Vec<(i32, i32)> = Vec::new();
++    for pass in 0..2 {
++        let start = hull.len();
++        let iter: Box<dyn Iterator<Item = &(i32, i32)>> = if pass == 0 {
++            Box::new(pts.iter())
++        } else {
++            Box::new(pts.iter().rev())
++        };
++        for &p in iter {
++            while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0
++            {
++                hull.pop();
++            }
++            hull.push(p);
++        }
++        hull.pop();
++    }
++    hull.into_iter().map(|(x, y)| (x as f64, y as f64)).collect()
++}
++
++fn polygon_area(p: &[Point]) -> f64 {
++    let n = p.len();
++    (0..n)
++        .map(|i| {
++            let (a, b) = (p[i], p[(i + 1) % n]);
++            a.0 * b.1 - b.0 * a.1
++        })
++        .sum::<f64>()
++        .abs()
++        / 2.0
++}
++
++/// Reduce a convex polygon to the 4 vertices that keep the most area, by
++/// repeatedly dropping the vertex whose removal loses the least.
++fn reduce_to_quad(mut p: Vec<Point>) -> Option<[Point; 4]> {
++    if p.len() < 4 {
++        return None;
++    }
++    while p.len() > 4 {
++        let n = p.len();
++        let loss = |i: usize| {
++            let (a, b, c) = (p[(i + n - 1) % n], p[i], p[(i + 1) % n]);
++            ((b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)).abs()
++        };
++        let worst = (0..n)
++            .min_by(|&i, &j| loss(i).total_cmp(&loss(j)))
++            .unwrap();
++        p.remove(worst);
++    }
++    Some([p[0], p[1], p[2], p[3]])
++}
++
++/// Top-left, top-right, bottom-right, bottom-left.
++fn order_corners(q: [Point; 4]) -> [Point; 4] {
++    let tl = *q.iter().min_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1))).unwrap();
++    let br = *q.iter().max_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1))).unwrap();
++    let tr = *q.iter().max_by(|a, b| (a.0 - a.1).total_cmp(&(b.0 - b.1))).unwrap();
++    let bl = *q.iter().min_by(|a, b| (a.0 - a.1).total_cmp(&(b.0 - b.1))).unwrap();
++    [tl, tr, br, bl]
++}
++
++fn dist(a: Point, b: Point) -> f64 {
++    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
++}
++
++/// Homography mapping the rectangle (0,0)-(w,h) onto the quad `c`.
++fn homography(w: f64, h: f64, c: &[Point; 4]) -> [f64; 8] {
++    let src = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)];
++    // Rows: x' = (a u + b v + c) / (g u + h v + 1), likewise y'.
++    let mut m = [[0.0f64; 9]; 8];
++    for k in 0..4 {
++        let (u, v) = src[k];
++        let (x, y) = c[k];
++        m[2 * k] = [u, v, 1.0, 0.0, 0.0, 0.0, -u * x, -v * x, x];
++        m[2 * k + 1] = [0.0, 0.0, 0.0, u, v, 1.0, -u * y, -v * y, y];
++    }
++    // Gaussian elimination with partial pivoting.
++    for col in 0..8 {
++        let piv = (col..8)
++            .max_by(|&a, &b| m[a][col].abs().total_cmp(&m[b][col].abs()))
++            .unwrap();
++        m.swap(col, piv);
++        let d = m[col][col];
++        if d.abs() < 1e-12 {
++            continue;
++        }
++        for k in col..9 {
++            m[col][k] /= d;
++        }
++        for row in 0..8 {
++            if row != col {
++                let f = m[row][col];
++                for k in col..9 {
++                    m[row][k] -= f * m[col][k];
++                }
++            }
++        }
++    }
++    std::array::from_fn(|i| m[i][8])
++}
++
++/// The page as an upright rectangle, sampled bilinearly from the photo.
++fn warp(img: &Rgb, c: &[Point; 4]) -> Rgb {
++    let w = ((dist(c[0], c[1]) + dist(c[3], c[2])) / 2.0).round().max(1.0);
++    let h = ((dist(c[0], c[3]) + dist(c[1], c[2])) / 2.0).round().max(1.0);
++    let hm = homography(w, h, c);
++    let (w, h) = (w as usize, h as usize);
++    let mut data = Vec::with_capacity(w * h * 3);
++    for v in 0..h {
++        for u in 0..w {
++            let (uf, vf) = (u as f64 + 0.5, v as f64 + 0.5);
++            let d = hm[6] * uf + hm[7] * vf + 1.0;
++            let x = (hm[0] * uf + hm[1] * vf + hm[2]) / d - 0.5;
++            let y = (hm[3] * uf + hm[4] * vf + hm[5]) / d - 0.5;
++            let x = x.clamp(0.0, (img.w - 1) as f64);
++            let y = y.clamp(0.0, (img.h - 1) as f64);
++            let (x0, y0) = (x.floor() as usize, y.floor() as usize);
++            let (x1, y1) = ((x0 + 1).min(img.w - 1), (y0 + 1).min(img.h - 1));
++            let (fx, fy) = (x - x0 as f64, y - y0 as f64);
++            let (p00, p10, p01, p11) = (img.px(x0, y0), img.px(x1, y0), img.px(x0, y1), img.px(x1, y1));
++            for ch in 0..3 {
++                let top = p00[ch] as f64 * (1.0 - fx) + p10[ch] as f64 * fx;
++                let bot = p01[ch] as f64 * (1.0 - fx) + p11[ch] as f64 * fx;
++                data.push((top * (1.0 - fy) + bot * fy).round() as u8);
++            }
++        }
++    }
++    Rgb { w, h, data }
++}
++
++/// Even out the paper: estimate its level per 32x32 block and colour
++/// channel from the brightest pixels (paper, not ink), smooth that, and
++/// scale each channel so the paper ends up neutral white. Shadows,
++/// vignetting and the light's tint go; ink stays dark.
++fn whiten(img: &mut Rgb) {
++    const B: usize = 32;
++    let (bw, bh) = (img.w.div_ceil(B), img.h.div_ceil(B));
++    // paper level per block and channel; the block is ranked by luma so the
++    // three channels come from the same (paper) pixels
++    let mut grid = vec![[0.0f64; 3]; bw * bh];
++    for by in 0..bh {
++        for bx in 0..bw {
++            let mut px: Vec<[u8; 3]> = Vec::with_capacity(B * B);
++            for y in by * B..((by + 1) * B).min(img.h) {
++                for x in bx * B..((bx + 1) * B).min(img.w) {
++                    px.push(img.px(x, y));
++                }
++            }
++            px.sort_unstable_by_key(|p| p[0] as u32 * 77 + p[1] as u32 * 150 + p[2] as u32 * 29);
++            let top = &px[px.len() * 8 / 10..px.len() * 95 / 100 + 1];
++            for c in 0..3 {
++                grid[by * bw + bx][c] =
++                    top.iter().map(|p| p[c] as f64).sum::<f64>() / top.len() as f64;
++            }
++        }
++    }
++    // Two 3x3 passes over the block grid, max-limited so a dark block (a
++    // picture on the page) borrows its neighbours' paper level.
++    for _ in 0..2 {
++        let g = grid.clone();
++        for by in 0..bh {
++            for bx in 0..bw {
++                for c in 0..3 {
++                    let (mut s, mut n, mut mx) = (0.0, 0.0, 0.0f64);
++                    for dy in -1i32..=1 {
++                        for dx in -1i32..=1 {
++                            let (x, y) = (bx as i32 + dx, by as i32 + dy);
++                            if x >= 0 && y >= 0 && (x as usize) < bw && (y as usize) < bh {
++                                let v = g[y as usize * bw + x as usize][c];
++                                s += v;
++                                n += 1.0;
++                                mx = mx.max(v);
++                            }
++                        }
++                    }
++                    grid[by * bw + bx][c] = (s / n).max(0.8 * mx);
++                }
++            }
++        }
++    }
++    for y in 0..img.h {
++        let gy = ((y as f64 + 0.5) / B as f64 - 0.5).clamp(0.0, (bh - 1) as f64);
++        let (y0, fy) = (gy.floor() as usize, gy.fract());
++        let y1 = (y0 + 1).min(bh - 1);
++        for x in 0..img.w {
++            let gx = ((x as f64 + 0.5) / B as f64 - 0.5).clamp(0.0, (bw - 1) as f64);
++            let (x0, fx) = (gx.floor() as usize, gx.fract());
++            let x1 = (x0 + 1).min(bw - 1);
++            let i = 3 * (y * img.w + x);
++            for c in 0..3 {
++                let top = grid[y0 * bw + x0][c] * (1.0 - fx) + grid[y0 * bw + x1][c] * fx;
++                let bot = grid[y1 * bw + x0][c] * (1.0 - fx) + grid[y1 * bw + x1][c] * fx;
++                let paper = (top * (1.0 - fy) + bot * fy).max(24.0);
++                let gain = (245.0 / paper).clamp(0.8, 4.0);
++                img.data[i + c] = (img.data[i + c] as f64 * gain).min(255.0).round() as u8;
++            }
++        }
++    }
++}
++
++/// The page corners `scan` would use, in photo pixels (for testing).
++#[allow(dead_code)]
++pub fn detect(photo: &Path) -> anyhow::Result<[Point; 4]> {
++    let img = load(photo)?;
++    let small = downscale(&img, DETECT_SIZE);
++    let corners = find_page(&small).context("No page found")?;
++    let s = img.w as f64 / small.w as f64;
++    Ok(corners.map(|(x, y)| ((x + 0.5) * s, (y + 0.5) * s)))
++}
+--- /dev/null
++++ b/src/scan_adjust.rs
+@@ -0,0 +1,262 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Dialog to adjust the page outline of a document scan before saving: the
++//! photo with the outline found in it and a handle on each corner to drag.
++
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++
++use adw::prelude::*;
++use gettextrs::gettext;
++use gtk::{cairo, glib};
++
++use crate::document::{Point, Prepared};
++
++/// Touch-friendly distance (in widget pixels) at which a handle is grabbed.
++const GRAB_RADIUS: f64 = 40.0;
++const HANDLE_RADIUS: f64 = 11.0;
++
++/// Maps between photo pixels and widget pixels for the current size.
++#[derive(Clone, Copy)]
++struct Fit {
++    scale: f64,
++    x0: f64,
++    y0: f64,
++}
++
++impl Fit {
++    fn new(photo_w: f64, photo_h: f64, area_w: f64, area_h: f64) -> Self {
++        let margin = HANDLE_RADIUS + 4.0;
++        let scale = ((area_w - 2.0 * margin) / photo_w)
++            .min((area_h - 2.0 * margin) / photo_h)
++            .max(0.01);
++        Self {
++            scale,
++            x0: (area_w - photo_w * scale) / 2.0,
++            y0: (area_h - photo_h * scale) / 2.0,
++        }
++    }
++
++    fn to_widget(self, p: Point) -> Point {
++        (self.x0 + p.0 * self.scale, self.y0 + p.1 * self.scale)
++    }
++
++    fn to_photo(self, p: Point) -> Point {
++        ((p.0 - self.x0) / self.scale, (p.1 - self.y0) / self.scale)
++    }
++}
++
++/// Shows the dialog over `window` and returns the corners to scan with, in
++/// photo pixels, or `None` if the user cancelled.
++pub async fn adjust_corners(window: &crate::Window, prep: &Prepared) -> Option<[Point; 4]> {
++    let (photo_w, photo_h) = (prep.width as f64, prep.height as f64);
++    let corners = Rc::new(RefCell::new(prep.corners));
++
++    let surface = {
++        let p = &prep.preview;
++        cairo::ImageSurface::create_for_data(
++            p.argb.clone(),
++            cairo::Format::ARgb32,
++            p.width as i32,
++            p.height as i32,
++            (p.width * 4) as i32,
++        )
++        .ok()?
++    };
++    let preview_scale = p_scale(prep);
++
++    let area = gtk::DrawingArea::builder()
++        .hexpand(true)
++        .vexpand(true)
++        .content_width(640)
++        .content_height(480)
++        .build();
++    area.set_draw_func(glib::clone!(
++        #[strong]
++        corners,
++        move |_, cr, w, h| {
++            let fit = Fit::new(photo_w, photo_h, w as f64, h as f64);
++            draw(cr, &surface, preview_scale, fit, &corners.borrow());
++        }
++    ));
++
++    // Drag the handle nearest to where the drag starts.
++    let dragged: Rc<Cell<Option<(usize, Point)>>> = Rc::default();
++    let drag = gtk::GestureDrag::new();
++    drag.connect_drag_begin(glib::clone!(
++        #[strong]
++        corners,
++        #[strong]
++        dragged,
++        move |gesture, x, y| {
++            let area = gesture.widget().unwrap();
++            let fit = Fit::new(photo_w, photo_h, area.width() as f64, area.height() as f64);
++            let nearest = corners
++                .borrow()
++                .iter()
++                .map(|&c| fit.to_widget(c))
++                .enumerate()
++                .map(|(i, (cx, cy))| (i, ((cx - x).powi(2) + (cy - y).powi(2)).sqrt()))
++                .min_by(|a, b| a.1.total_cmp(&b.1));
++            match nearest {
++                Some((i, d)) if d <= GRAB_RADIUS => {
++                    dragged.set(Some((i, fit.to_widget(corners.borrow()[i]))));
++                    gesture.set_state(gtk::EventSequenceState::Claimed);
++                }
++                _ => {
++                    dragged.set(None);
++                    gesture.set_state(gtk::EventSequenceState::Denied);
++                }
++            }
++        }
++    ));
++    drag.connect_drag_update(glib::clone!(
++        #[strong]
++        corners,
++        #[strong]
++        dragged,
++        move |gesture, dx, dy| {
++            let Some((i, start)) = dragged.get() else {
++                return;
++            };
++            let area = gesture.widget().unwrap();
++            let fit = Fit::new(photo_w, photo_h, area.width() as f64, area.height() as f64);
++            let (x, y) = fit.to_photo((start.0 + dx, start.1 + dy));
++            corners.borrow_mut()[i] = (x.clamp(0.0, photo_w - 1.0), y.clamp(0.0, photo_h - 1.0));
++            area.queue_draw();
++        }
++    ));
++    drag.connect_drag_end(glib::clone!(
++        #[strong]
++        dragged,
++        move |_, _, _| dragged.set(None)
++    ));
++    area.add_controller(drag);
++
++    let (sender, receiver) = futures_channel::oneshot::channel::<Option<[Point; 4]>>();
++    let sender = Rc::new(RefCell::new(Some(sender)));
++
++    let cancel = gtk::Button::with_label(&gettext("Cancel"));
++    let save = gtk::Button::builder()
++        .label(gettext("Save Scan"))
++        .css_classes(["suggested-action"])
++        .build();
++    let header = adw::HeaderBar::builder()
++        .show_start_title_buttons(false)
++        .show_end_title_buttons(false)
++        .build();
++    header.pack_start(&cancel);
++    header.pack_end(&save);
++
++    let hint = gtk::Label::builder()
++        .label(if prep.detected {
++            gettext("Drag the corners onto the page’s corners")
++        } else {
++            gettext("No page found: drag the corners onto the page’s corners")
++        })
++        .wrap(true)
++        .margin_top(6)
++        .margin_bottom(12)
++        .margin_start(12)
++        .margin_end(12)
++        .css_classes(["dim-label"])
++        .build();
++
++    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
++    content.append(&area);
++    content.append(&hint);
++
++    let toolbar = adw::ToolbarView::new();
++    toolbar.add_top_bar(&header);
++    toolbar.set_content(Some(&content));
++
++    let dialog = adw::Dialog::builder()
++        .title(gettext("Adjust Page"))
++        .content_width(900)
++        .content_height(720)
++        .child(&toolbar)
++        .build();
++
++    let finish = {
++        let sender = sender.clone();
++        move |result: Option<[Point; 4]>| {
++            if let Some(sender) = sender.borrow_mut().take() {
++                let _ = sender.send(result);
++            }
++        }
++    };
++    cancel.connect_clicked(glib::clone!(
++        #[weak]
++        dialog,
++        move |_| {
++            dialog.close();
++        }
++    ));
++    save.connect_clicked(glib::clone!(
++        #[weak]
++        dialog,
++        #[strong]
++        corners,
++        #[strong]
++        finish,
++        move |_| {
++            finish(Some(*corners.borrow()));
++            dialog.close();
++        }
++    ));
++    dialog.connect_closed(move |_| finish(None));
++
++    dialog.present(Some(window));
++    receiver.await.ok().flatten()
++}
++
++/// Photo pixels per preview pixel.
++fn p_scale(prep: &Prepared) -> f64 {
++    prep.width as f64 / prep.preview.width as f64
++}
++
++fn draw(cr: &cairo::Context, photo: &cairo::ImageSurface, preview_scale: f64, fit: Fit, c: &[Point; 4]) {
++    // the photo
++    cr.save().ok();
++    cr.translate(fit.x0, fit.y0);
++    cr.scale(fit.scale * preview_scale, fit.scale * preview_scale);
++    cr.set_source_surface(photo, 0.0, 0.0).ok();
++    cr.source().set_filter(cairo::Filter::Good);
++    cr.paint().ok();
++    cr.restore().ok();
++
++    let w: Vec<Point> = c.iter().map(|&p| fit.to_widget(p)).collect();
++
++    // shade what will be cut away
++    let (pw, ph) = (photo.width() as f64 * preview_scale, photo.height() as f64 * preview_scale);
++    let (x1, y1) = fit.to_widget((0.0, 0.0));
++    let (x2, y2) = fit.to_widget((pw, ph));
++    cr.set_fill_rule(cairo::FillRule::EvenOdd);
++    cr.rectangle(x1, y1, x2 - x1, y2 - y1);
++    cr.move_to(w[0].0, w[0].1);
++    for p in &w[1..] {
++        cr.line_to(p.0, p.1);
++    }
++    cr.close_path();
++    cr.set_source_rgba(0.0, 0.0, 0.0, 0.45);
++    cr.fill().ok();
++
++    // outline
++    cr.move_to(w[0].0, w[0].1);
++    for p in &w[1..] {
++        cr.line_to(p.0, p.1);
++    }
++    cr.close_path();
++    cr.set_line_width(2.5);
++    cr.set_source_rgb(0.21, 0.52, 0.89);
++    cr.stroke().ok();
++
++    // handles
++    for p in &w {
++        cr.arc(p.0, p.1, HANDLE_RADIUS, 0.0, std::f64::consts::TAU);
++        cr.set_source_rgb(1.0, 1.0, 1.0);
++        cr.fill_preserve().ok();
++        cr.set_line_width(3.0);
++        cr.set_source_rgb(0.21, 0.52, 0.89);
++        cr.stroke().ok();
++    }
++}

@@ -1,0 +1,4 @@
+[source.crates-io]
+replace-with = "vendored"
+[source.vendored]
+directory = "/home/lukas/surface-kit/vendor/snapshot-src/gnome-snapshot-50.0/debian/missing-sources"

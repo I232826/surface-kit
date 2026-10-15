@@ -15,6 +15,12 @@ declare -A BUILD=(
     [libcamera-v4l2]=libcamera/build-deb.sh
     [gstreamer1.0-libcamera]=libcamera/build-deb.sh
     [gnome-snapshot]=snapshot/build-deb.sh
+    # not held (GNOME Shell and security updates follow mutter closely):
+    # an update replaces ours and this reports it
+    [libmutter-18-0]=mutter/build-deb.sh
+    [mutter-common]=mutter/build-deb.sh
+    [mutter-common-bin]=mutter/build-deb.sh
+    [gir1.2-mutter-18]=mutter/build-deb.sh
 )
 attention=0
 for pkg in "${!BUILD[@]}"; do

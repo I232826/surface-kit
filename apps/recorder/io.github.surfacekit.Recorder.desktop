@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Recorder
+Comment=Record voice and sound with one tap
+Exec=recorder
+Icon=audio-recorder
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;GTK;
+Keywords=voice;memo;microphone;record;Aufnahme;Sprachmemo;
+StartupNotify=true
+DBusActivatable=false

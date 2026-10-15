@@ -1,0 +1,290 @@
+From: surface-kit
+Subject: backends/sprite: Show a dot for the pen instead of the arrow
+
+Like on Windows, the pen (and the eraser) shows a small dot where it
+points instead of the standard cursor shapes (arrow, text cursor,
+hand...), whether an app or the shell (top bar, dock, desktop) asks for
+them. Done where a tablet sprite's cursor reaches the renderer, so it also
+covers the moment before an app has set a cursor. A hidden cursor stays
+hidden and an app's own cursor image, such as a brush outline, is kept;
+the mouse is unchanged. The dot is drawn here at the output scale.
+MUTTER_PEN_DOT=0 in the environment turns it off.
+---
+--- a/src/backends/meta-sprite.c
++++ b/src/backends/meta-sprite.c
+@@ -23,7 +23,14 @@
+ #include "backends/meta-backend-private.h"
+ #include "backends/meta-cursor-tracker-private.h"
+ 
++#include <math.h>
++
++#include "backends/meta-cursor-xcursor.h"
++#include "backends/meta-logical-monitor-private.h"
++#include "backends/meta-monitor-manager-private.h"
++#include "clutter/clutter-mutter.h"
+ #include "clutter/clutter-sprite-private.h"
++#include "cogl/cogl.h"
+ 
+ enum
+ {
+@@ -88,6 +95,250 @@
+     }
+ }
+ 
++/*
++ * surface-kit: a Windows-style dot under the pen instead of the arrow, text
++ * cursor, hand and so on. Drawn here at the output scale; MUTTER_PEN_DOT=0
++ * in the environment turns it off.
++ */
++#define PEN_DOT_SIZE 9 /* logical pixels */
++
++#define META_TYPE_PEN_DOT_CURSOR (meta_pen_dot_cursor_get_type ())
++G_DECLARE_FINAL_TYPE (MetaPenDotCursor, meta_pen_dot_cursor,
++                      META, PEN_DOT_CURSOR, ClutterCursor)
++
++struct _MetaPenDotCursor
++{
++  ClutterCursor parent;
++
++  MetaBackend *backend;
++  CoglTexture *texture;
++  int scale; /* the scale the texture was drawn for, 0 = none yet */
++  gboolean changed;
++};
++
++G_DEFINE_FINAL_TYPE (MetaPenDotCursor, meta_pen_dot_cursor, CLUTTER_TYPE_CURSOR)
++
++/* A near-black dot with a light rim, so it shows on dark and light content. */
++static void
++pen_dot_ensure_texture (MetaPenDotCursor *dot,
++                        int               scale)
++{
++  ClutterBackend *clutter_backend;
++  CoglContext *cogl_context;
++  g_autoptr (CoglTexture) texture = NULL;
++  g_autoptr (GError) error = NULL;
++  g_autofree uint8_t *pixels = NULL;
++  CoglPixelFormat format;
++  int size, x, y;
++  float center, r_core, r_rim;
++
++  scale = MAX (scale, 1);
++  if (dot->texture && dot->scale == scale)
++    return;
++
++  size = PEN_DOT_SIZE * scale;
++  center = size / 2.0f;
++  r_core = 1.6f * scale;
++  r_rim = r_core + 1.0f * scale;
++  pixels = g_malloc0 (size * size * 4);
++
++  for (y = 0; y < size; y++)
++    {
++      for (x = 0; x < size; x++)
++        {
++          float d = hypotf (x + 0.5f - center, y + 0.5f - center);
++          float rim = CLAMP (r_rim + 0.5f - d, 0.0f, 1.0f);
++          float core = CLAMP (r_core + 0.5f - d, 0.0f, 1.0f);
++          float alpha = MAX (rim * 0.9f, core);
++          float value = 250.0f * (1.0f - core) + 25.0f * core;
++          uint8_t *px = &pixels[(y * size + x) * 4];
++
++          /* premultiplied, grey: the same in every colour channel */
++          px[0] = px[1] = px[2] = (uint8_t) roundf (value * alpha);
++          px[3] = (uint8_t) roundf (255.0f * alpha);
++        }
++    }
++
++#if G_BYTE_ORDER == G_LITTLE_ENDIAN
++  format = COGL_PIXEL_FORMAT_BGRA_8888_PRE;
++#else
++  format = COGL_PIXEL_FORMAT_ARGB_8888_PRE;
++#endif
++  clutter_backend = meta_backend_get_clutter_backend (dot->backend);
++  cogl_context = clutter_backend_get_cogl_context (clutter_backend);
++  texture = cogl_texture_2d_new_from_data (cogl_context, size, size, format,
++                                           size * 4, pixels, &error);
++  if (!texture)
++    {
++      g_warning ("Failed to allocate the pen dot cursor: %s", error->message);
++      return;
++    }
++
++  g_set_object (&dot->texture, texture);
++  dot->scale = scale;
++  dot->changed = TRUE;
++  clutter_cursor_emit_texture_changed (CLUTTER_CURSOR (dot));
++}
++
++static CoglTexture *
++meta_pen_dot_cursor_get_texture (ClutterCursor *cursor,
++                                 int           *hot_x,
++                                 int           *hot_y)
++{
++  MetaPenDotCursor *dot = META_PEN_DOT_CURSOR (cursor);
++  int hot = PEN_DOT_SIZE * MAX (dot->scale, 1) / 2;
++
++  if (hot_x)
++    *hot_x = hot;
++  if (hot_y)
++    *hot_y = hot;
++
++  return dot->texture;
++}
++
++static gboolean
++meta_pen_dot_cursor_realize_texture (ClutterCursor *cursor)
++{
++  MetaPenDotCursor *dot = META_PEN_DOT_CURSOR (cursor);
++  gboolean changed;
++
++  pen_dot_ensure_texture (dot, dot->scale);
++  changed = dot->changed;
++  dot->changed = FALSE;
++
++  return changed;
++}
++
++static gboolean
++meta_pen_dot_cursor_is_animated (ClutterCursor *cursor)
++{
++  return FALSE;
++}
++
++static void
++meta_pen_dot_cursor_tick_frame (ClutterCursor *cursor)
++{
++}
++
++static unsigned int
++meta_pen_dot_cursor_get_current_frame_time (ClutterCursor *cursor)
++{
++  return 0;
++}
++
++/* The same scale handling as MetaCursorXcursor's. */
++static void
++meta_pen_dot_cursor_prepare_at (ClutterCursor *cursor,
++                                float          best_scale,
++                                int            x,
++                                int            y)
++{
++  MetaPenDotCursor *dot = META_PEN_DOT_CURSOR (cursor);
++
++  if (meta_backend_is_stage_views_scaled (dot->backend))
++    {
++      if (best_scale != 0.0f)
++        {
++          pen_dot_ensure_texture (dot, (int) ceilf (best_scale));
++          clutter_cursor_realize_texture (cursor);
++          clutter_cursor_set_viewport_dst_size (cursor,
++                                                PEN_DOT_SIZE, PEN_DOT_SIZE);
++        }
++    }
++  else
++    {
++      MetaMonitorManager *monitor_manager =
++        meta_backend_get_monitor_manager (dot->backend);
++      MetaLogicalMonitor *logical_monitor =
++        meta_monitor_manager_get_logical_monitor_at (monitor_manager, x, y);
++
++      if (logical_monitor)
++        {
++          pen_dot_ensure_texture (dot, (int) logical_monitor->scale);
++          clutter_cursor_realize_texture (cursor);
++          clutter_cursor_set_texture_scale (cursor, 1.0f);
++          clutter_cursor_reset_viewport_dst_size (cursor);
++        }
++    }
++}
++
++static void
++meta_pen_dot_cursor_finalize (GObject *object)
++{
++  MetaPenDotCursor *dot = META_PEN_DOT_CURSOR (object);
++
++  g_clear_object (&dot->texture);
++
++  G_OBJECT_CLASS (meta_pen_dot_cursor_parent_class)->finalize (object);
++}
++
++static void
++meta_pen_dot_cursor_init (MetaPenDotCursor *dot)
++{
++}
++
++static void
++meta_pen_dot_cursor_class_init (MetaPenDotCursorClass *klass)
++{
++  GObjectClass *object_class = G_OBJECT_CLASS (klass);
++  ClutterCursorClass *cursor_class = CLUTTER_CURSOR_CLASS (klass);
++
++  object_class->finalize = meta_pen_dot_cursor_finalize;
++
++  cursor_class->get_texture = meta_pen_dot_cursor_get_texture;
++  cursor_class->realize_texture = meta_pen_dot_cursor_realize_texture;
++  cursor_class->is_animated = meta_pen_dot_cursor_is_animated;
++  cursor_class->tick_frame = meta_pen_dot_cursor_tick_frame;
++  cursor_class->get_current_frame_time =
++    meta_pen_dot_cursor_get_current_frame_time;
++  cursor_class->prepare_at = meta_pen_dot_cursor_prepare_at;
++}
++
++/* One dot for all pens, kept for the life of the compositor. */
++static ClutterCursor *
++meta_sprite_get_pen_dot (MetaBackend *backend)
++{
++  static MetaPenDotCursor *dot = NULL;
++
++  if (!dot)
++    {
++      ClutterContext *clutter_context =
++        meta_backend_get_clutter_context (backend);
++      ClutterColorManager *color_manager =
++        clutter_context_get_color_manager (clutter_context);
++
++      dot = g_object_new (META_TYPE_PEN_DOT_CURSOR,
++                          "color-state",
++                          clutter_color_manager_get_default_color_state (color_manager),
++                          NULL);
++      dot->backend = backend;
++    }
++
++  return CLUTTER_CURSOR (dot);
++}
++
++/*
++ * The cursor a tablet sprite (pen, eraser) shows: the dot in place of the
++ * standard shapes (arrow, text cursor, hand...), wherever they come from,
++ * an app or the shell. An app's own cursor image (a brush outline) is kept,
++ * and so is a hidden cursor.
++ */
++static ClutterCursor *
++meta_sprite_tablet_cursor (MetaBackend   *backend,
++                           ClutterCursor *cursor)
++{
++  static int enabled = -1;
++
++  if (enabled < 0)
++    enabled = g_strcmp0 (g_getenv ("MUTTER_PEN_DOT"), "0") != 0;
++
++  if (!enabled || !cursor || !META_IS_CURSOR_XCURSOR (cursor) ||
++      meta_cursor_xcursor_get_cursor (META_CURSOR_XCURSOR (cursor)) == CLUTTER_CURSOR_NONE)
++    return cursor;
++
++  return meta_sprite_get_pen_dot (backend);
++}
++
+ static void
+ meta_sprite_update_cursor (ClutterSprite *sprite,
+                            ClutterCursor *cursor)
+@@ -119,6 +370,9 @@
+     }
+   else
+     {
++      if (clutter_sprite_get_role (sprite) == CLUTTER_SPRITE_ROLE_TABLET)
++        cursor = meta_sprite_tablet_cursor (priv->backend, cursor);
++
+       meta_cursor_renderer_set_cursor (cursor_renderer, cursor);
+     }
+ }

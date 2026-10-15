@@ -6,7 +6,8 @@ picture, video and QR codes:
 - the camera streams at full resolution in it (3200x2400 on the Surface
   Pro 7 rear camera instead of 1080p)
 - while framing, the page is outlined live over the preview (aperture
-  hands the app a 320 px copy of the feed 5 times a second; the same
+  hands the app a 320 px copy of the feed 5 times a second, read in
+  passing so the preview stays zero-copy and sharp; the same
   detection runs on it in a worker thread)
 - after each shot the page is found (`src/document.rs`): grown out from
   the brightest paper across gradual changes, so a shadow over the page

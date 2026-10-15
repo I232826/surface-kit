@@ -27,7 +27,9 @@ crates.
 
 While framing in document mode the page is outlined live over the
 preview: aperture gains a frame-sampled signal (a 320 px RGB copy of the
-feed 5 times a second, from a leaky tee branch) and draws an outline set
+feed 5 times a second, read in passing by a pad probe on the tee, so the
+preview keeps its zero-copy DMA-BUF frames; a tee branch wanting system
+memory had made GTK scale 3200 px frames itself, pixelated) and draws an outline set
 with Viewfinder::set_page_outline; the app runs the same detection on a
 worker thread, one frame at a time, smoothing small moves.
 
@@ -155,7 +157,7 @@ changes had already put them on the filter without a restart).
          enable_hw_encoding: Cell<bool>,
  
          pub qrcode_branch: RefCell<Option<gst::Element>>,
-+        pub sample_branch: RefCell<Option<gst::Element>>,
++        pub sample_probe: RefCell<Option<gst::PadProbeId>>,
 +        /// Corners of a page outline drawn over the feed, as shares of the
 +        /// frame's width and height.
 +        pub page_outline: Cell<Option<[(f64, f64); 4]>>,
@@ -203,12 +205,12 @@ changes had already put them on the filter without a restart).
          pub(crate) fn set_state(&self, state: ViewfinderState) {
              if state != self.state.replace(state) {
                  self.obj().notify_state();
-@@ -116,6 +156,36 @@
+@@ -116,6 +156,33 @@
              self.obj().notify_detect_codes();
          }
  
 +        fn sample_frames(&self) -> bool {
-+            self.sample_branch.borrow().is_some()
++            self.sample_probe.borrow().is_some()
 +        }
 +
 +        fn set_sample_frames(&self, value: bool) {
@@ -217,19 +219,16 @@ changes had already put them on the filter without a restart).
 +            }
 +
 +            let tee = self.tee.get().unwrap();
++            let pad = tee.static_pad("sink").unwrap();
 +            if value {
-+                match crate::frame_sampler::create_bin() {
-+                    Ok(branch) => {
-+                        tee.add_branch(&branch);
-+                        self.sample_branch.replace(Some(branch));
-+                    }
-+                    Err(err) => {
-+                        log::error!("Could not create frame sampler: {err}");
-+                    }
++                let probe = crate::frame_sampler::attach(&pad, tee.upcast_ref());
++                if probe.is_none() {
++                    log::error!("Could not sample frames");
 +                }
++                self.sample_probe.replace(probe);
 +            } else {
-+                if let Some(branch) = self.sample_branch.take() {
-+                    tee.remove_branch(&branch);
++                if let Some(probe) = self.sample_probe.take() {
++                    pad.remove_probe(probe);
 +                }
 +                self.obj().set_page_outline(None);
 +            }
@@ -240,7 +239,7 @@ changes had already put them on the filter without a restart).
          /// Sets the camera that the `ApertureViewfinder` will use.
          fn set_camera(&self, camera: Option<crate::Camera>) {
              let obj = self.obj();
-@@ -421,6 +491,15 @@
+@@ -421,6 +488,15 @@
                      glib::subclass::Signal::builder("code-detected")
                          .param_types([glib::Bytes::static_type()])
                          .build(),
@@ -256,7 +255,7 @@ changes had already put them on the filter without a restart).
                  ]
              });
              SIGNALS.as_ref()
-@@ -438,6 +517,7 @@
+@@ -438,6 +514,7 @@
          }
  
          fn unrealize(&self) {
@@ -264,7 +263,7 @@ changes had already put them on the filter without a restart).
              log::debug!("Viewfinder unrealized: stopping stream");
              self.obj().stop_stream();
  
-@@ -451,9 +531,11 @@
+@@ -451,9 +528,11 @@
                  snapshot.translate(&graphene::Point::new(w, 0.0));
                  snapshot.scale(-1.0, 1.0);
                  self.parent_snapshot(snapshot);
@@ -276,7 +275,7 @@ changes had already put them on the filter without a restart).
              }
          }
      }
-@@ -703,6 +785,27 @@
+@@ -703,6 +782,27 @@
          );
      }
  
@@ -304,7 +303,7 @@ changes had already put them on the filter without a restart).
      pub fn connect_code_detected<F: Fn(&Self, glib::Bytes) + 'static>(&self, f: F) {
          self.connect_closure(
              "code-detected",
-@@ -783,6 +886,34 @@
+@@ -783,6 +883,34 @@
          }
      }
  
@@ -339,7 +338,7 @@ changes had already put them on the filter without a restart).
      /// Stops the viewfinder.
      ///
      /// A black frame will be shown after this methods has been called.
-@@ -808,6 +939,17 @@
+@@ -808,6 +936,17 @@
                  Some(s) if s.has_name("video-done") => {
                      self.on_video_done();
                  }
@@ -349,7 +348,7 @@ changes had already put them on the filter without a restart).
 +                        s.get::<u32>("width"),
 +                        s.get::<u32>("height"),
 +                        s.get::<u32>("stride"),
-+                    ) && self.imp().sample_branch.borrow().is_some()
++                    ) && self.imp().sample_probe.borrow().is_some()
 +                    {
 +                        self.emit_by_name::<()>("frame-sampled", &[&data, &width, &height, &stride]);
 +                    }
@@ -2538,167 +2537,137 @@ changes had already put them on the filter without a restart).
 +}
 --- /dev/null
 +++ b/aperture/src/frame_sampler.rs
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,131 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Hands small RGB copies of the preview to the app (as "frame-sample" bus
 +//! messages), for analysis such as the live page outline in document mode.
-+use std::sync::LazyLock;
++//!
++//! The frames are looked at in passing, by a probe on the pad the feed
++//! enters the viewfinder's tee through, not by a branch of the tee: a
++//! branch takes part in negotiating the stream, and one that wants system
++//! memory talks the preview out of zero-copy GPU buffers, which the
++//! compositor scales smoothly, into ones GTK scales with jagged edges.
++use std::sync::Mutex;
++use std::time::{Duration, Instant};
 +
-+use gst_video::{prelude::*, video_frame::VideoFrameRef};
++use gst::prelude::*;
 +use gtk::glib;
 +
 +/// Width of the frames handed out; the height follows the aspect ratio.
-+pub(crate) const SAMPLE_WIDTH: i32 = 320;
-+/// Frames handed out per second, at most.
-+const SAMPLE_RATE: i32 = 5;
++const SAMPLE_WIDTH: usize = 320;
++/// Time between frames handed out, at least.
++const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 +
-+mod imp {
-+    use gst::{BufferRef, subclass::prelude::*};
-+    use gst_video::subclass::prelude::*;
++/// Where red, green and blue sit in a pixel, and its size in bytes.
++#[derive(Clone, Copy)]
++struct Layout {
++    r: usize,
++    g: usize,
++    b: usize,
++    pstride: usize,
++}
 +
-+    use super::*;
++const fn layout(r: usize, g: usize, b: usize, pstride: usize) -> Option<Layout> {
++    Some(Layout { r, g, b, pstride })
++}
 +
-+    #[derive(Default)]
-+    pub struct FrameSampler {}
-+
-+    #[glib::object_subclass]
-+    impl ObjectSubclass for FrameSampler {
-+        const NAME: &'static str = "ApertureFrameSampler";
-+        type Type = super::FrameSampler;
-+        type ParentType = gst_video::VideoFilter;
-+    }
-+
-+    impl ObjectImpl for FrameSampler {}
-+    impl GstObjectImpl for FrameSampler {}
-+
-+    impl ElementImpl for FrameSampler {
-+        fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
-+            static ELEMENT_METADATA: LazyLock<gst::subclass::ElementMetadata> =
-+                LazyLock::new(|| {
-+                    gst::subclass::ElementMetadata::new(
-+                        "Frame sampler",
-+                        "Filter/Video",
-+                        "Posts copies of RGB frames on the bus",
-+                        "surface-kit",
-+                    )
-+                });
-+
-+            Some(&*ELEMENT_METADATA)
++/// The packed RGB layout of the caps, if they have one this can read:
++/// system memory with a GStreamer format, or a linear DMA-BUF with a DRM
++/// fourcc (DRM names the bits of a little-endian word, so XRGB8888 is
++/// B, G, R, X in memory).
++fn caps_layout(caps: &gst::CapsRef) -> Option<(Layout, usize, usize)> {
++    let s = caps.structure(0)?;
++    let width = s.get::<i32>("width").ok()? as usize;
++    let height = s.get::<i32>("height").ok()? as usize;
++    let format = s.get::<&str>("format").ok()?;
++    let l = if format == "DMA_DRM" {
++        let drm = s.get::<&str>("drm-format").ok()?;
++        let (fourcc, modifier) = drm.split_once(':').unwrap_or((drm, "0x0"));
++        if u64::from_str_radix(modifier.trim_start_matches("0x"), 16).ok()? != 0 {
++            return None; // tiled: not readable as rows
 +        }
++        match fourcc {
++            "XR24" | "AR24" => layout(2, 1, 0, 4),
++            "XB24" | "AB24" => layout(0, 1, 2, 4),
++            "RX24" | "RA24" => layout(3, 2, 1, 4),
++            "BX24" | "BA24" => layout(1, 2, 3, 4),
++            "RG24" => layout(2, 1, 0, 3),
++            "BG24" => layout(0, 1, 2, 3),
++            _ => None,
++        }
++    } else {
++        match format {
++            "BGRx" | "BGRA" => layout(2, 1, 0, 4),
++            "RGBx" | "RGBA" => layout(0, 1, 2, 4),
++            "xRGB" | "ARGB" => layout(1, 2, 3, 4),
++            "xBGR" | "ABGR" => layout(3, 2, 1, 4),
++            "RGB" => layout(0, 1, 2, 3),
++            "BGR" => layout(2, 1, 0, 3),
++            _ => None,
++        }
++    }?;
++    Some((l, width, height))
++}
 +
-+        fn pad_templates() -> &'static [gst::PadTemplate] {
-+            static PAD_TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
-+                let caps = gst_video::video_make_raw_caps(&[gst_video::VideoFormat::Rgb]).build();
-+                vec![
-+                    gst::PadTemplate::new(
-+                        "src",
-+                        gst::PadDirection::Src,
-+                        gst::PadPresence::Always,
-+                        &caps,
-+                    )
-+                    .unwrap(),
-+                    gst::PadTemplate::new(
-+                        "sink",
-+                        gst::PadDirection::Sink,
-+                        gst::PadPresence::Always,
-+                        &caps,
-+                    )
-+                    .unwrap(),
-+                ]
-+            });
-+
-+            PAD_TEMPLATES.as_ref()
++/// A small RGB copy of the frame in `buffer`: nearest pixel from the
++/// middle of each output pixel's area. Returns (RGB, width, height).
++fn shrink(buffer: &gst::BufferRef, l: Layout, w: usize, h: usize) -> Option<(Vec<u8>, usize, usize)> {
++    let (offset, stride) = match buffer.meta::<gst_video::VideoMeta>() {
++        Some(meta) => (meta.offset()[0], meta.stride()[0] as usize),
++        None => (0, w * l.pstride),
++    };
++    let map = buffer.map_readable().ok()?;
++    let data = map.as_slice().get(offset..)?;
++    if w == 0 || h == 0 || data.len() < (h - 1) * stride + w * l.pstride {
++        return None;
++    }
++    let ow = SAMPLE_WIDTH.min(w);
++    let oh = (h * ow / w).max(1);
++    let mut rgb = Vec::with_capacity(ow * oh * 3);
++    for y in 0..oh {
++        let row = &data[((2 * y + 1) * h / (2 * oh)) * stride..];
++        for x in 0..ow {
++            let px = &row[((2 * x + 1) * w / (2 * ow)) * l.pstride..];
++            rgb.extend_from_slice(&[px[l.r], px[l.g], px[l.b]]);
 +        }
 +    }
++    Some((rgb, ow, oh))
++}
 +
-+    impl BaseTransformImpl for FrameSampler {
-+        const MODE: gst_base::subclass::BaseTransformMode =
-+            gst_base::subclass::BaseTransformMode::AlwaysInPlace;
-+        const PASSTHROUGH_ON_SAME_CAPS: bool = true;
-+        const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
-+    }
-+
-+    impl VideoFilterImpl for FrameSampler {
-+        fn transform_frame_ip_passthrough(
-+            &self,
-+            frame: &VideoFrameRef<&BufferRef>,
-+        ) -> Result<gst::FlowSuccess, gst::FlowError> {
-+            let Ok(data) = frame.plane_data(0) else {
-+                return Ok(gst::FlowSuccess::Ok);
-+            };
++/// Starts sampling the frames passing `pad`, posting them on the bus as
++/// coming from `element`. Remove the returned probe to stop.
++pub(crate) fn attach(pad: &gst::Pad, element: &gst::Element) -> Option<gst::PadProbeId> {
++    let last = Mutex::new(None::<Instant>);
++    let element = element.downgrade();
++    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
++        let now = Instant::now();
++        {
++            let mut last = last.lock().unwrap();
++            if last.is_some_and(|t| now - t < SAMPLE_INTERVAL) {
++                return gst::PadProbeReturn::Ok;
++            }
++            *last = Some(now);
++        }
++        let (Some(buffer), Some(caps), Some(element)) =
++            (info.buffer(), pad.current_caps(), element.upgrade())
++        else {
++            return gst::PadProbeReturn::Ok;
++        };
++        let Some((l, w, h)) = caps_layout(&caps) else {
++            return gst::PadProbeReturn::Ok;
++        };
++        if let Some((rgb, ow, oh)) = shrink(buffer, l, w, h) {
 +            let structure = gst::Structure::builder("frame-sample")
-+                .field("rgb", glib::Bytes::from(data))
-+                .field("width", frame.width())
-+                .field("height", frame.height())
-+                .field("stride", frame.plane_stride()[0] as u32)
++                .field("rgb", glib::Bytes::from_owned(rgb))
++                .field("width", ow as u32)
++                .field("height", oh as u32)
++                .field("stride", (ow * 3) as u32)
 +                .build();
-+            let msg = gst::message::Element::builder(structure)
-+                .src(&*self.obj())
-+                .build();
-+            self.post_message(msg);
-+            Ok(gst::FlowSuccess::Ok)
++            let msg = gst::message::Element::builder(structure).src(&element).build();
++            let _ = element.post_message(msg);
 +        }
-+    }
-+}
-+
-+glib::wrapper! {
-+    pub struct FrameSampler(ObjectSubclass<imp::FrameSampler>)
-+        @extends gst::Object, gst::Element, gst_base::BaseTransform, gst_video::VideoFilter;
-+}
-+
-+impl Default for FrameSampler {
-+    fn default() -> Self {
-+        glib::Object::new()
-+    }
-+}
-+
-+/// A tee branch: a few frames a second, scaled down to RGB, sampled. The
-+/// queue in front drops frames rather than holding up the preview.
-+pub(crate) fn create_bin() -> Result<gst::Element, glib::BoolError> {
-+    let bin = gst::Bin::new();
-+
-+    let queue = gst::ElementFactory::make("queue")
-+        .property_from_str("leaky", "downstream")
-+        .property("max-size-buffers", 1u32)
-+        .property("max-size-bytes", 0u32)
-+        .property("max-size-time", 0u64)
-+        .build()?;
-+    let videorate = gst::ElementFactory::make("videorate").build()?;
-+    videorate.set_property("max-rate", SAMPLE_RATE);
-+    videorate.set_property("drop-only", true);
-+    let videoscale = gst::ElementFactory::make("videoscale").build()?;
-+    let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
-+    let capsfilter = gst::ElementFactory::make("capsfilter").build()?;
-+    let caps = gst::Caps::builder("video/x-raw")
-+        .field("format", gst_video::VideoFormat::Rgb.to_str())
-+        .field("width", SAMPLE_WIDTH)
-+        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
-+        .build();
-+    capsfilter.set_property("caps", &caps);
-+    let sampler = FrameSampler::default().upcast::<gst::Element>();
-+    let fakesink = gst::ElementFactory::make("fakesink")
-+        .property("sync", false)
-+        .property("async", false)
-+        .build()?;
-+
-+    let elements = [
-+        &queue,
-+        &videorate,
-+        &videoscale,
-+        &videoconvert,
-+        &capsfilter,
-+        &sampler,
-+        &fakesink,
-+    ];
-+    bin.add_many(elements)?;
-+    gst::Element::link_many(elements)?;
-+
-+    let pad = queue.static_pad("sink").unwrap();
-+    let ghost_pad = gst::GhostPad::with_target(&pad)?;
-+    ghost_pad.set_active(true)?;
-+    bin.add_pad(&ghost_pad)?;
-+
-+    Ok(bin.upcast())
++        gst::PadProbeReturn::Ok
++    })
 +}
 --- /dev/null
 +++ b/data/resources/icons/camera-autofocus-symbolic.svg

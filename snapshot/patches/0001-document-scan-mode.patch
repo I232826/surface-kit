@@ -3,11 +3,14 @@ Subject: Document scanning mode, full-resolution photos, refocus button
 
 A fourth capture mode next to picture, video and QR codes. A photo taken in
 it is turned into a scan of the page in the background: the page is found
-(masks of the brightest area at several thresholds, of the paper's colour
-at any brightness so shadows stay on the page, and of colours rare along
-the border; of the outlines that are mostly filled and have real edges
-the largest wins),
-its four corners taken from the convex hull. A dialog shows the photo
+(grown out from the brightest paper across gradual changes, so a shadow
+over the page, often the tablet's own, is crossed while the page's edge
+stops it; failing that, masks of the brightest area at several
+thresholds, of the paper's colour at any brightness, and of colours rare
+along the border, of which the largest mostly filled outline with real
+edges wins), its four corners taken from the convex hull and, for the
+grown page, moved to where the outline covers the most page and the
+least else. A dialog shows the photo
 with that outline and a handle on each corner to drag (a page on other
 white paper has no edge to find); without a page it starts just inside
 the frame. Save warps the page to an upright rectangle, evens out the
@@ -17,18 +20,28 @@ scanner, adapted to the page's measured noise (dim rooms mean high gain):
 mask on luma for text edges, and levels with a 1.3 gamma that take paper
 plus its grain to white and ink to neutral black while keeping thin lines
 and coloured marks.
-The photo stays next to the scan. Plain Rust and cairo, no new crates.
+Shadows are lifted per colour channel up to 12x, and the cleanup
+smooths and drops colour harder where it had to lift (the noise came up
+with it). The photo stays next to the scan. Plain Rust and cairo, no new
+crates.
+
+While framing in document mode the page is outlined live over the
+preview: aperture gains a frame-sampled signal (a 320 px RGB copy of the
+feed 5 times a second, from a leaky tee branch) and draws an outline set
+with Viewfinder::set_page_outline; the app runs the same detection on a
+worker thread, one frame at a time, smoothing small moves.
 
 The adjust dialog also turns the page (an arrow marks the side that
-becomes the top; the last rotation is kept for the next page), switches
-to black and white (remembered in document-black-white), shows a
+becomes the top; the last rotation is kept for the next page), picks the
+filter (Off: only cut out and straightened; Filter: the cleanup; B&W:
+cleanup then black and white; remembered in document-filter), shows a
 magnifier while a corner is dragged, and collects pages: "Add Page" keeps
 the scan for a PDF, and the next page saved normally writes them all into
 one PDF, with an Open button. With Tesseract installed the PDF is
 searchable (German and English text layer); otherwise the JPEG pages go
 in as they are.
 
-A focus button next to the countdown, and a tap on the picture, ask the
+A focus button next to the shutter, and a tap on the picture, ask the
 camera to focus again: they touch $XDG_RUNTIME_DIR/libcamera-af-trigger,
 which the surface-kit libcamera build's autofocus watches.
 
@@ -40,17 +53,414 @@ full resolution at 4:3 (3200x2400). Changing mode restarts the stream
 whenever the profile changes (comparing caps missed that: other mode
 changes had already put them on the filter without a restart).
 ---
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -2,6 +2,8 @@
- #[rustfmt::skip]
- mod config;
- mod application;
-+mod document;
-+mod scan_adjust;
+--- a/aperture/src/lib.rs
++++ b/aperture/src/lib.rs
+@@ -23,6 +23,7 @@
+ mod device_provider;
  mod enums;
+ mod error;
++mod frame_sampler;
+ mod pipeline_tee;
  mod utils;
- mod widgets;
+ mod viewfinder;
+@@ -35,6 +36,18 @@
+ pub use utils::{is_h264_encoding_supported, is_hardware_encoding_supported};
+ pub use viewfinder::Viewfinder;
+ 
++/// Which stream format the viewfinder asks the camera for.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u8)]
++pub enum StreamResolution {
++    /// At most 1080p, 16:9: the preview, video, QR codes.
++    Video,
++    /// The camera's full width at 16:9: pictures are taken from the stream.
++    Photo,
++    /// Full resolution at 4:3: pages.
++    Document,
++}
++
+ pub(crate) static APP_ID: OnceLock<&'static str> = OnceLock::new();
+ pub(crate) const SUPPORTED_ENCODINGS: [&str; 2] = ["video/x-raw", "image/jpeg"];
+ pub(crate) const PREFERRED_FORMATS: [&str; 5] = ["I420", "BGRx", "RGBx", "xBGR", "xRGB"];
+--- a/aperture/src/utils.rs
++++ b/aperture/src/utils.rs
+@@ -6,6 +6,17 @@
+ 
+ pub(crate) mod caps {
+     use std::sync::LazyLock;
++    use std::sync::atomic::{AtomicU8, Ordering};
++
++    use crate::StreamResolution;
++
++    // The app starts in picture mode without announcing it
++    static RESOLUTION: AtomicU8 = AtomicU8::new(StreamResolution::Photo as u8);
++
++    /// Returns whether the setting changed.
++    pub(crate) fn set_resolution(resolution: StreamResolution) -> bool {
++        RESOLUTION.swap(resolution as u8, Ordering::Relaxed) != resolution as u8
++    }
+ 
+     use super::Size;
+ 
+@@ -32,8 +43,11 @@
+     pub(crate) fn best_mode(caps: &gst::Caps) -> Option<Size> {
+         const MIN_WIDTH: i32 = 640;
+         const MIN_HEIGHT: i32 = 480;
+-        const MAX_HEIGHT: i32 = 1080;
+-        const OPTIMAL_RATIO: f32 = 16.0 / 9.0;
++        let (max_height, optimal_ratio): (i32, f32) = match RESOLUTION.load(Ordering::Relaxed) {
++            r if r == StreamResolution::Photo as u8 => (4096, 16.0 / 9.0),
++            r if r == StreamResolution::Document as u8 => (4096, 4.0 / 3.0),
++            _ => (1080, 16.0 / 9.0),
++        };
+ 
+         let mut best_size_optimal_ratio: Option<Size> = None;
+         let mut best_size_any_ratio: Option<Size> = None;
+@@ -51,11 +65,11 @@
+                 best_size_fallback = Some(Size { width, height });
+             }
+ 
+-            let max_width = (height as f32 * OPTIMAL_RATIO).ceil() as i32;
++            let max_width = (height as f32 * optimal_ratio).ceil() as i32;
+             if (MIN_WIDTH..=max_width).contains(&width)
+-                && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height)
++                && (MIN_HEIGHT..=max_height).contains(&height)
+             {
+-                if width == (height as f32 * OPTIMAL_RATIO) as i32 {
++                if width == (height as f32 * optimal_ratio) as i32 {
+                     if let Some(Size {
+                         width: best_w,
+                         height: best_h,
+--- a/aperture/src/viewfinder.rs
++++ b/aperture/src/viewfinder.rs
+@@ -6,7 +6,7 @@
+ use gst::prelude::*;
+ use gtk::prelude::*;
+ use gtk::subclass::prelude::*;
+-use gtk::{gdk, gio, glib, graphene};
++use gtk::{gdk, gio, glib, graphene, gsk};
+ 
+ use crate::VideoFormat;
+ use crate::ViewfinderState;
+@@ -43,6 +43,8 @@
+         state: Cell<ViewfinderState>,
+         #[property(get = Self::detect_codes, set = Self::set_detect_codes, explicit_notify)]
+         detect_codes: Cell<bool>,
++        #[property(get = Self::sample_frames, set = Self::set_sample_frames, explicit_notify)]
++        sample_frames: Cell<bool>,
+         #[property(get, set = Self::set_camera, nullable, explicit_notify)]
+         camera: RefCell<Option<crate::Camera>>,
+         #[property(get = Self::is_recording, name = "is-recording", type = bool)]
+@@ -55,6 +57,10 @@
+         enable_hw_encoding: Cell<bool>,
+ 
+         pub qrcode_branch: RefCell<Option<gst::Element>>,
++        pub sample_branch: RefCell<Option<gst::Element>>,
++        /// Corners of a page outline drawn over the feed, as shares of the
++        /// frame's width and height.
++        pub page_outline: Cell<Option<[(f64, f64); 4]>>,
+         pub devices: OnceCell<crate::DeviceProvider>,
+         pub camera_src: RefCell<Option<gst::Element>>,
+         pub camerabin: OnceCell<gst::Element>,
+@@ -79,6 +85,40 @@
+             self.camerabin.get().unwrap()
+         }
+ 
++        /// The page outline over the feed, which the picture shows
++        /// letterboxed (contain).
++        fn snapshot_page_outline(&self, snapshot: &gtk::Snapshot) {
++            let Some(corners) = self.page_outline.get() else {
++                return;
++            };
++            let Some(paintable) = self.picture.paintable() else {
++                return;
++            };
++            let aspect = paintable.intrinsic_aspect_ratio();
++            let (w, h) = (self.obj().width() as f64, self.obj().height() as f64);
++            if aspect <= 0.0 || w <= 0.0 || h <= 0.0 {
++                return;
++            }
++            let (cw, ch) = if w / h > aspect { (h * aspect, h) } else { (w, w / aspect) };
++            let (x0, y0) = ((w - cw) / 2.0, (h - ch) / 2.0);
++
++            let builder = gsk::PathBuilder::new();
++            for (i, (x, y)) in corners.iter().enumerate() {
++                let (px, py) = ((x0 + x * cw) as f32, (y0 + y * ch) as f32);
++                if i == 0 {
++                    builder.move_to(px, py);
++                } else {
++                    builder.line_to(px, py);
++                }
++            }
++            builder.close();
++            let path = builder.to_path();
++            snapshot.append_fill(&path, gsk::FillRule::Winding, &gdk::RGBA::new(0.21, 0.52, 0.89, 0.18));
++            let stroke = gsk::Stroke::new(3.0);
++            stroke.set_line_join(gsk::LineJoin::Round);
++            snapshot.append_stroke(&path, &stroke, &gdk::RGBA::new(0.21, 0.52, 0.89, 0.95));
++        }
++
+         pub(crate) fn set_state(&self, state: ViewfinderState) {
+             if state != self.state.replace(state) {
+                 self.obj().notify_state();
+@@ -116,6 +156,36 @@
+             self.obj().notify_detect_codes();
+         }
+ 
++        fn sample_frames(&self) -> bool {
++            self.sample_branch.borrow().is_some()
++        }
++
++        fn set_sample_frames(&self, value: bool) {
++            if value == self.sample_frames.replace(value) {
++                return;
++            }
++
++            let tee = self.tee.get().unwrap();
++            if value {
++                match crate::frame_sampler::create_bin() {
++                    Ok(branch) => {
++                        tee.add_branch(&branch);
++                        self.sample_branch.replace(Some(branch));
++                    }
++                    Err(err) => {
++                        log::error!("Could not create frame sampler: {err}");
++                    }
++                }
++            } else {
++                if let Some(branch) = self.sample_branch.take() {
++                    tee.remove_branch(&branch);
++                }
++                self.obj().set_page_outline(None);
++            }
++
++            self.obj().notify_sample_frames();
++        }
++
+         /// Sets the camera that the `ApertureViewfinder` will use.
+         fn set_camera(&self, camera: Option<crate::Camera>) {
+             let obj = self.obj();
+@@ -421,6 +491,15 @@
+                     glib::subclass::Signal::builder("code-detected")
+                         .param_types([glib::Bytes::static_type()])
+                         .build(),
++                    // RGB bytes, width, height, stride
++                    glib::subclass::Signal::builder("frame-sampled")
++                        .param_types([
++                            glib::Bytes::static_type(),
++                            u32::static_type(),
++                            u32::static_type(),
++                            u32::static_type(),
++                        ])
++                        .build(),
+                 ]
+             });
+             SIGNALS.as_ref()
+@@ -438,6 +517,7 @@
+         }
+ 
+         fn unrealize(&self) {
++            self.page_outline.set(None);
+             log::debug!("Viewfinder unrealized: stopping stream");
+             self.obj().stop_stream();
+ 
+@@ -451,9 +531,11 @@
+                 snapshot.translate(&graphene::Point::new(w, 0.0));
+                 snapshot.scale(-1.0, 1.0);
+                 self.parent_snapshot(snapshot);
++                self.snapshot_page_outline(snapshot);
+                 snapshot.restore();
+             } else {
+                 self.parent_snapshot(snapshot);
++                self.snapshot_page_outline(snapshot);
+             }
+         }
+     }
+@@ -703,6 +785,27 @@
+         );
+     }
+ 
++    /// Small RGB copies of the feed, a few a second, while
++    /// [`sample-frames`](#sample-frames) is on: bytes, width, height, stride.
++    pub fn connect_frame_sampled<F: Fn(&Self, glib::Bytes, u32, u32, u32) + 'static>(&self, f: F) {
++        self.connect_closure(
++            "frame-sampled",
++            false,
++            glib::closure_local!(|obj, data, width, height, stride| {
++                f(obj, data, width, height, stride);
++            }),
++        );
++    }
++
++    /// Draws a page outline over the feed, corners as shares (0-1) of the
++    /// frame's width and height in the order to join them; `None` hides it.
++    pub fn set_page_outline(&self, corners: Option<[(f64, f64); 4]>) {
++        let imp = self.imp();
++        if imp.page_outline.replace(corners) != corners {
++            self.queue_draw();
++        }
++    }
++
+     pub fn connect_code_detected<F: Fn(&Self, glib::Bytes) + 'static>(&self, f: F) {
+         self.connect_closure(
+             "code-detected",
+@@ -783,6 +886,34 @@
+         }
+     }
+ 
++    /// Picks the stream format for what is being captured (see
++    /// [`crate::StreamResolution`]). Restarts a running stream with it.
++    pub fn set_resolution(&self, resolution: crate::StreamResolution) {
++        if !crate::utils::caps::set_resolution(resolution) {
++            return;
++        }
++
++        let imp = self.imp();
++        let (Some(camera), Some(capsfilter)) = (self.camera(), imp.capsfilter.get()) else {
++            return;
++        };
++        // Decide by the setting, not by comparing caps: other mode changes
++        // can have put the new caps on the filter already, but only a
++        // restart makes the running stream take them.
++        let caps = camera.best_caps();
++        // Not only Playing: while previewing camerabin can report Paused
++        // (or sit in a locked state), and the new format must still apply.
++        let running = !matches!(imp.camerabin().current_state(), gst::State::Null);
++        log::debug!("Stream resolution {resolution:?}, restarting the stream: {running}");
++        if running {
++            self.stop_stream();
++        }
++        capsfilter.set_property("caps", &caps);
++        if running {
++            self.start_stream();
++        }
++    }
++
+     /// Stops the viewfinder.
+     ///
+     /// A black frame will be shown after this methods has been called.
+@@ -808,6 +939,17 @@
+                 Some(s) if s.has_name("video-done") => {
+                     self.on_video_done();
+                 }
++                Some(s) if s.has_name("frame-sample") => {
++                    if let (Ok(data), Ok(width), Ok(height), Ok(stride)) = (
++                        s.get::<glib::Bytes>("rgb"),
++                        s.get::<u32>("width"),
++                        s.get::<u32>("height"),
++                        s.get::<u32>("stride"),
++                    ) && self.imp().sample_branch.borrow().is_some()
++                    {
++                        self.emit_by_name::<()>("frame-sampled", &[&data, &width, &height, &stride]);
++                    }
++                }
+                 Some(s) if s.has_name("qrcode") => {
+                     let data = s.get::<glib::Bytes>("payload").unwrap();
+ 
+--- a/data/org.gnome.Snapshot.gschema.xml.in
++++ b/data/org.gnome.Snapshot.gschema.xml.in
+@@ -4,6 +4,7 @@
+     <value nick="picture" value="0" />
+     <value nick="video" value="1" />
+     <value nick="qr-detection" value="2" />
++    <value nick="document" value="3" />
+   </enum>
+   <enum id="org.gnome.Snapshot.PictureFormat">
+     <value nick="jpeg" value="0" />
+@@ -59,6 +60,16 @@
+       <summary>Picture format</summary>
+       <description>Whether to save pictures as png or jpeg</description>
+     </key>
++    <key name="document-filter" type="s">
++      <choices>
++        <choice value="off"/>
++        <choice value="clean"/>
++        <choice value="black-white"/>
++      </choices>
++      <default>"clean"</default>
++      <summary>Filter for document scans</summary>
++      <description>What document mode does to a page after straightening it: "off" leaves it as photographed, "clean" whitens the paper and sharpens the text, "black-white" also turns it into black and white.</description>
++    </key>
+     <key name="last-camera-id" type="s">
+       <default>""</default>
+       <summary>Last Camera Used ID</summary>
+--- a/data/resources/resources.gresource.xml.in
++++ b/data/resources/resources.gresource.xml.in
+@@ -19,5 +19,6 @@
+     <file preprocess="xml-stripblanks" alias ="external-link-symbolic.svg">icons/external-link-symbolic.svg</file>
+     <file preprocess="xml-stripblanks" alias ="pick-camera-alt2-symbolic.svg">icons/pick-camera-alt2-symbolic.svg</file>
+     <file preprocess="xml-stripblanks" alias ="qr-code-symbolic.svg">icons/qr-code-symbolic.svg</file>
++    <file preprocess="xml-stripblanks" alias="camera-autofocus-symbolic.svg">icons/camera-autofocus-symbolic.svg</file>
+   </gresource>
+ </gresources>
+--- a/data/resources/ui/camera_controls.ui
++++ b/data/resources/ui/camera_controls.ui
+@@ -26,6 +26,19 @@
+       </object>
+     </child>
+     <child>
++      <object class="GtkButton" id="autofocus_button">
++        <property name="valign">center</property>
++        <property name="halign">center</property>
++        <property name="icon-name">camera-autofocus-symbolic</property>
++        <property name="tooltip-text" translatable="yes">Focus Again</property>
++        <property name="action-name">camera.autofocus</property>
++        <style>
++          <class name="camerabutton" />
++          <class name="circular" />
++        </style>
++      </object>
++    </child>
++    <child>
+       <object class="GtkStack" id="camera_menu_button_stack">
+         <child>
+           <object class="GtkMenuButton" id="camera_menu_button">
+--- a/data/resources/ui/camera.ui
++++ b/data/resources/ui/camera.ui
+@@ -119,16 +119,21 @@
+                         <child type="overlay">
+                           <object class="AdwMultiLayoutView" id="multi_layout_view">
+                             <child type="countdown-button">
+-                              <object class="GtkMenuButton">
+-                                <property name="menu-model">countdown_menu</property>
+-                                <property name="icon-name">camera-timer-symbolic</property>
++                              <object class="GtkBox">
++                                <property name="spacing">6</property>
+                                 <property name="valign">center</property>
+                                 <property name="halign">center</property>
+-                                <property name="tooltip-text" translatable="yes">Countdown</property>
+-                                <style>
+-                                  <class name="circular" />
+-                                  <class name="flat" />
+-                                </style>
++                                <child>
++                                  <object class="GtkMenuButton">
++                                    <property name="menu-model">countdown_menu</property>
++                                    <property name="icon-name">camera-timer-symbolic</property>
++                                    <property name="tooltip-text" translatable="yes">Countdown</property>
++                                    <style>
++                                      <class name="circular" />
++                                      <class name="flat" />
++                                    </style>
++                                  </object>
++                                </child>
+                               </object>
+                             </child>
+                             <child type="primary-menu">
+@@ -178,6 +183,13 @@
+                                     <property name="name">qr-code</property>
+                                   </object>
+                                 </child>
++                                <child>
++                                  <object class="AdwToggle">
++                                    <property name="icon-name">x-office-document-symbolic</property>
++                                    <property name="tooltip" translatable="yes">Document Scanning Mode</property>
++                                    <property name="name">document</property>
++                                  </object>
++                                </child>
+                               </object>
+                             </child>
+                             <child>
 --- a/src/enums.rs
 +++ b/src/enums.rs
 @@ -48,6 +48,7 @@
@@ -69,48 +479,17 @@ changes had already put them on the filter without a restart).
              _ => Self::default(),
          }
      }
---- a/src/widgets/window.rs
-+++ b/src/widgets/window.rs
-@@ -73,7 +73,9 @@
-             self.camera.stop_stream();
- 
-             match obj.capture_mode() {
--                CaptureMode::Picture => obj.set_shutter_mode(crate::ShutterMode::Picture),
-+                CaptureMode::Picture | CaptureMode::Document => {
-+                    obj.set_shutter_mode(crate::ShutterMode::Picture)
-+                }
-                 CaptureMode::Video => obj.set_shutter_mode(crate::ShutterMode::Video),
-                 CaptureMode::QrDetection => (),
-             }
-@@ -102,7 +104,7 @@
-             klass.install_action_async("win.take-picture", None, async |window, _, _| {
-                 if let Err(err) = window.on_take_picture().await {
-                     match window.capture_mode() {
--                        CaptureMode::Picture => {
-+                        CaptureMode::Picture | CaptureMode::Document => {
-                             log::error!("Could not take picture: {err}");
-                             window.send_toast(&gettext("Could not take picture"));
-                         }
-@@ -358,7 +360,7 @@
-                         async move {
-                             if let Err(err) = window.shutter_action().await {
-                                 match window.capture_mode() {
--                                    CaptureMode::Picture => {
-+                                    CaptureMode::Picture | CaptureMode::Document => {
-                                         log::error!("Could not take picture: {err}");
-                                         window.send_toast(&gettext("Could not take picture"));
-                                     }
-@@ -448,6 +450,10 @@
-         preferences.present(Some(self));
-     }
- 
-+    pub fn add_toast(&self, toast: adw::Toast) {
-+        self.imp().toast_overlay.add_toast(toast);
-+    }
-+
-     pub fn send_toast(&self, text: &str) {
-         let toast = adw::Toast::new(text);
-         self.imp().toast_overlay.add_toast(toast);
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -2,6 +2,8 @@
+ #[rustfmt::skip]
+ mod config;
+ mod application;
++mod document;
++mod scan_adjust;
+ mod enums;
+ mod utils;
+ mod widgets;
 --- a/src/widgets/camera.rs
 +++ b/src/widgets/camera.rs
 @@ -13,6 +13,12 @@
@@ -126,7 +505,21 @@ changes had already put them on the filter without a restart).
  mod imp {
      use std::cell::{Cell, OnceCell, RefCell};
  
-@@ -81,6 +87,10 @@
+@@ -38,6 +44,13 @@
+         #[property(get, set = Self::set_capture_mode, explicit_notify, default)]
+         capture_mode: Cell<crate::CaptureMode>,
+ 
++        /// Live page outline in document mode: a frame is being searched,
++        /// the outline shown (shares of the frame), frames since a page
++        /// was last found.
++        pub outline_busy: Cell<bool>,
++        pub outline: Cell<Option<[(f64, f64); 4]>>,
++        pub outline_misses: Cell<u32>,
++
+         #[template_child]
+         pub single_landscape_bp: TemplateChild<adw::Breakpoint>,
+         #[template_child]
+@@ -81,6 +94,10 @@
              klass.bind_template();
              klass.bind_template_callbacks();
              klass.set_css_name("camera");
@@ -137,7 +530,7 @@ changes had already put them on the filter without a restart).
          }
  
          fn instance_init(obj: &glib::subclass::InitializingObject<Self>) {
-@@ -93,7 +103,7 @@
+@@ -93,7 +110,7 @@
          fn set_capture_mode(&self, capture_mode: crate::CaptureMode) {
              if capture_mode != self.capture_mode.replace(capture_mode) {
                  match capture_mode {
@@ -146,10 +539,13 @@ changes had already put them on the filter without a restart).
                          self.obj().set_shutter_mode(crate::ShutterMode::Picture);
                      }
                      CaptureMode::Video => {
-@@ -103,6 +113,13 @@
+@@ -103,6 +120,16 @@
                  };
                  self.obj()
                      .set_detect_codes(matches!(capture_mode, CaptureMode::QrDetection));
++                self.viewfinder
++                    .set_sample_frames(matches!(capture_mode, CaptureMode::Document));
++                self.outline.set(None);
 +                // Pictures are taken from the stream: let it carry every
 +                // pixel the sensor has where they end up in a photo.
 +                self.viewfinder.set_resolution(match capture_mode {
@@ -160,7 +556,7 @@ changes had already put them on the filter without a restart).
  
                  self.obj().notify_capture_mode();
              }
-@@ -134,6 +151,20 @@
+@@ -134,6 +161,20 @@
  
              let obj = self.obj();
  
@@ -181,7 +577,87 @@ changes had already put them on the filter without a restart).
              let provider = aperture::DeviceProvider::instance();
              self.provider.set(provider.clone()).unwrap();
  
-@@ -526,8 +557,15 @@
+@@ -184,6 +225,14 @@
+                 }
+             ));
+ 
++            self.viewfinder.connect_frame_sampled(glib::clone!(
++                #[weak]
++                obj,
++                move |_, data, width, height, stride| {
++                    obj.find_page_live(data, width, height, stride);
++                }
++            ));
++
+             self.viewfinder.connect_code_detected(glib::clone!(
+                 #[weak]
+                 obj,
+@@ -500,6 +549,64 @@
+         self.imp().camera_controls.set_shutter_mode(shutter_mode);
+     }
+ 
++    /// Looks for the page in a frame of the feed and outlines it, one frame
++    /// at a time (others arriving meanwhile are skipped). The outline
++    /// follows small moves smoothly, jumps to a new place, and goes once no
++    /// page has been found for a few frames.
++    fn find_page_live(&self, data: glib::Bytes, width: u32, height: u32, stride: u32) {
++        let imp = self.imp();
++        if imp.outline_busy.replace(true) {
++            return;
++        }
++        glib::spawn_future_local(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            async move {
++                let (w, h) = (width as usize, height as usize);
++                let found = gio::spawn_blocking(move || {
++                    crate::document::find_page_in_frame(w, h, stride as usize, &data)
++                })
++                .await
++                .ok()
++                .flatten();
++                let imp = obj.imp();
++                imp.outline_busy.set(false);
++                if obj.capture_mode() != crate::CaptureMode::Document {
++                    return;
++                }
++
++                let outline = match found {
++                    Some(c) => {
++                        imp.outline_misses.set(0);
++                        let new = c.map(|(x, y)| (x / w as f64, y / h as f64));
++                        match imp.outline.get() {
++                            Some(old)
++                                if old.iter().zip(&new).all(|(a, b)| {
++                                    (a.0 - b.0).abs() < 0.08 && (a.1 - b.1).abs() < 0.08
++                                }) =>
++                            {
++                                Some(std::array::from_fn(|i| {
++                                    (
++                                        0.5 * (old[i].0 + new[i].0),
++                                        0.5 * (old[i].1 + new[i].1),
++                                    )
++                                }))
++                            }
++                            _ => Some(new),
++                        }
++                    }
++                    None => {
++                        let misses = imp.outline_misses.get() + 1;
++                        imp.outline_misses.set(misses);
++                        if misses < 3 { imp.outline.get() } else { None }
++                    }
++                };
++                imp.outline.set(outline);
++                imp.viewfinder.set_page_outline(outline);
++            }
++        ));
++    }
++
+     fn set_detect_codes(&self, detect_codes: bool) {
+         let imp = self.imp();
+ 
+@@ -526,8 +633,15 @@
                  let window = obj.root().and_downcast::<crate::Window>().unwrap();
                  window.set_shutter_enabled(true);
                  // TODO Maybe report error via toast on None
@@ -199,7 +675,7 @@ changes had already put them on the filter without a restart).
                  }
              }
          ));
-@@ -545,6 +583,122 @@
+@@ -545,6 +659,122 @@
          imp.camera_controls.set_gallery(&gallery);
      }
  
@@ -322,204 +798,51 @@ changes had already put them on the filter without a restart).
      pub fn stop_stream(&self) {
          self.imp().viewfinder.stop_stream();
      }
---- a/data/org.gnome.Snapshot.gschema.xml.in
-+++ b/data/org.gnome.Snapshot.gschema.xml.in
-@@ -4,6 +4,7 @@
-     <value nick="picture" value="0" />
-     <value nick="video" value="1" />
-     <value nick="qr-detection" value="2" />
-+    <value nick="document" value="3" />
-   </enum>
-   <enum id="org.gnome.Snapshot.PictureFormat">
-     <value nick="jpeg" value="0" />
-@@ -59,6 +60,11 @@
-       <summary>Picture format</summary>
-       <description>Whether to save pictures as png or jpeg</description>
-     </key>
-+    <key name="document-black-white" type="b">
-+      <default>false</default>
-+      <summary>Black and white document scans</summary>
-+      <description>Whether scans in document mode are saved in black and white instead of colour.</description>
-+    </key>
-     <key name="last-camera-id" type="s">
-       <default>""</default>
-       <summary>Last Camera Used ID</summary>
---- a/data/resources/ui/camera.ui
-+++ b/data/resources/ui/camera.ui
-@@ -119,16 +119,32 @@
-                         <child type="overlay">
-                           <object class="AdwMultiLayoutView" id="multi_layout_view">
-                             <child type="countdown-button">
--                              <object class="GtkMenuButton">
--                                <property name="menu-model">countdown_menu</property>
--                                <property name="icon-name">camera-timer-symbolic</property>
-+                              <object class="GtkBox">
-+                                <property name="spacing">6</property>
-                                 <property name="valign">center</property>
-                                 <property name="halign">center</property>
--                                <property name="tooltip-text" translatable="yes">Countdown</property>
--                                <style>
--                                  <class name="circular" />
--                                  <class name="flat" />
--                                </style>
-+                                <child>
-+                                  <object class="GtkButton" id="autofocus_button">
-+                                    <property name="icon-name">camera-autofocus-symbolic</property>
-+                                    <property name="tooltip-text" translatable="yes">Focus Again</property>
-+                                    <property name="action-name">camera.autofocus</property>
-+                                    <style>
-+                                      <class name="circular" />
-+                                      <class name="flat" />
-+                                    </style>
-+                                  </object>
-+                                </child>
-+                                <child>
-+                                  <object class="GtkMenuButton">
-+                                    <property name="menu-model">countdown_menu</property>
-+                                    <property name="icon-name">camera-timer-symbolic</property>
-+                                    <property name="tooltip-text" translatable="yes">Countdown</property>
-+                                    <style>
-+                                      <class name="circular" />
-+                                      <class name="flat" />
-+                                    </style>
-+                                  </object>
-+                                </child>
-                               </object>
-                             </child>
-                             <child type="primary-menu">
-@@ -178,6 +194,13 @@
-                                     <property name="name">qr-code</property>
-                                   </object>
-                                 </child>
-+                                <child>
-+                                  <object class="AdwToggle">
-+                                    <property name="icon-name">x-office-document-symbolic</property>
-+                                    <property name="tooltip" translatable="yes">Document Scanning Mode</property>
-+                                    <property name="name">document</property>
-+                                  </object>
-+                                </child>
-                               </object>
-                             </child>
-                             <child>
---- a/data/resources/resources.gresource.xml.in
-+++ b/data/resources/resources.gresource.xml.in
-@@ -19,5 +19,6 @@
-     <file preprocess="xml-stripblanks" alias ="external-link-symbolic.svg">icons/external-link-symbolic.svg</file>
-     <file preprocess="xml-stripblanks" alias ="pick-camera-alt2-symbolic.svg">icons/pick-camera-alt2-symbolic.svg</file>
-     <file preprocess="xml-stripblanks" alias ="qr-code-symbolic.svg">icons/qr-code-symbolic.svg</file>
-+    <file preprocess="xml-stripblanks" alias="camera-autofocus-symbolic.svg">icons/camera-autofocus-symbolic.svg</file>
-   </gresource>
- </gresources>
---- a/aperture/src/lib.rs
-+++ b/aperture/src/lib.rs
-@@ -35,6 +35,18 @@
- pub use utils::{is_h264_encoding_supported, is_hardware_encoding_supported};
- pub use viewfinder::Viewfinder;
+--- a/src/widgets/window.rs
++++ b/src/widgets/window.rs
+@@ -73,7 +73,9 @@
+             self.camera.stop_stream();
  
-+/// Which stream format the viewfinder asks the camera for.
-+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-+#[repr(u8)]
-+pub enum StreamResolution {
-+    /// At most 1080p, 16:9: the preview, video, QR codes.
-+    Video,
-+    /// The camera's full width at 16:9: pictures are taken from the stream.
-+    Photo,
-+    /// Full resolution at 4:3: pages.
-+    Document,
-+}
-+
- pub(crate) static APP_ID: OnceLock<&'static str> = OnceLock::new();
- pub(crate) const SUPPORTED_ENCODINGS: [&str; 2] = ["video/x-raw", "image/jpeg"];
- pub(crate) const PREFERRED_FORMATS: [&str; 5] = ["I420", "BGRx", "RGBx", "xBGR", "xRGB"];
---- a/aperture/src/utils.rs
-+++ b/aperture/src/utils.rs
-@@ -6,6 +6,17 @@
- 
- pub(crate) mod caps {
-     use std::sync::LazyLock;
-+    use std::sync::atomic::{AtomicU8, Ordering};
-+
-+    use crate::StreamResolution;
-+
-+    // The app starts in picture mode without announcing it
-+    static RESOLUTION: AtomicU8 = AtomicU8::new(StreamResolution::Photo as u8);
-+
-+    /// Returns whether the setting changed.
-+    pub(crate) fn set_resolution(resolution: StreamResolution) -> bool {
-+        RESOLUTION.swap(resolution as u8, Ordering::Relaxed) != resolution as u8
-+    }
- 
-     use super::Size;
- 
-@@ -32,8 +43,11 @@
-     pub(crate) fn best_mode(caps: &gst::Caps) -> Option<Size> {
-         const MIN_WIDTH: i32 = 640;
-         const MIN_HEIGHT: i32 = 480;
--        const MAX_HEIGHT: i32 = 1080;
--        const OPTIMAL_RATIO: f32 = 16.0 / 9.0;
-+        let (max_height, optimal_ratio): (i32, f32) = match RESOLUTION.load(Ordering::Relaxed) {
-+            r if r == StreamResolution::Photo as u8 => (4096, 16.0 / 9.0),
-+            r if r == StreamResolution::Document as u8 => (4096, 4.0 / 3.0),
-+            _ => (1080, 16.0 / 9.0),
-+        };
- 
-         let mut best_size_optimal_ratio: Option<Size> = None;
-         let mut best_size_any_ratio: Option<Size> = None;
-@@ -51,11 +65,11 @@
-                 best_size_fallback = Some(Size { width, height });
+             match obj.capture_mode() {
+-                CaptureMode::Picture => obj.set_shutter_mode(crate::ShutterMode::Picture),
++                CaptureMode::Picture | CaptureMode::Document => {
++                    obj.set_shutter_mode(crate::ShutterMode::Picture)
++                }
+                 CaptureMode::Video => obj.set_shutter_mode(crate::ShutterMode::Video),
+                 CaptureMode::QrDetection => (),
              }
- 
--            let max_width = (height as f32 * OPTIMAL_RATIO).ceil() as i32;
-+            let max_width = (height as f32 * optimal_ratio).ceil() as i32;
-             if (MIN_WIDTH..=max_width).contains(&width)
--                && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height)
-+                && (MIN_HEIGHT..=max_height).contains(&height)
-             {
--                if width == (height as f32 * OPTIMAL_RATIO) as i32 {
-+                if width == (height as f32 * optimal_ratio) as i32 {
-                     if let Some(Size {
-                         width: best_w,
-                         height: best_h,
---- a/aperture/src/viewfinder.rs
-+++ b/aperture/src/viewfinder.rs
-@@ -783,6 +783,34 @@
-         }
+@@ -102,7 +104,7 @@
+             klass.install_action_async("win.take-picture", None, async |window, _, _| {
+                 if let Err(err) = window.on_take_picture().await {
+                     match window.capture_mode() {
+-                        CaptureMode::Picture => {
++                        CaptureMode::Picture | CaptureMode::Document => {
+                             log::error!("Could not take picture: {err}");
+                             window.send_toast(&gettext("Could not take picture"));
+                         }
+@@ -358,7 +360,7 @@
+                         async move {
+                             if let Err(err) = window.shutter_action().await {
+                                 match window.capture_mode() {
+-                                    CaptureMode::Picture => {
++                                    CaptureMode::Picture | CaptureMode::Document => {
+                                         log::error!("Could not take picture: {err}");
+                                         window.send_toast(&gettext("Could not take picture"));
+                                     }
+@@ -448,6 +450,10 @@
+         preferences.present(Some(self));
      }
  
-+    /// Picks the stream format for what is being captured (see
-+    /// [`crate::StreamResolution`]). Restarts a running stream with it.
-+    pub fn set_resolution(&self, resolution: crate::StreamResolution) {
-+        if !crate::utils::caps::set_resolution(resolution) {
-+            return;
-+        }
-+
-+        let imp = self.imp();
-+        let (Some(camera), Some(capsfilter)) = (self.camera(), imp.capsfilter.get()) else {
-+            return;
-+        };
-+        // Decide by the setting, not by comparing caps: other mode changes
-+        // can have put the new caps on the filter already, but only a
-+        // restart makes the running stream take them.
-+        let caps = camera.best_caps();
-+        // Not only Playing: while previewing camerabin can report Paused
-+        // (or sit in a locked state), and the new format must still apply.
-+        let running = !matches!(imp.camerabin().current_state(), gst::State::Null);
-+        log::debug!("Stream resolution {resolution:?}, restarting the stream: {running}");
-+        if running {
-+            self.stop_stream();
-+        }
-+        capsfilter.set_property("caps", &caps);
-+        if running {
-+            self.start_stream();
-+        }
++    pub fn add_toast(&self, toast: adw::Toast) {
++        self.imp().toast_overlay.add_toast(toast);
 +    }
 +
-     /// Stops the viewfinder.
-     ///
-     /// A black frame will be shown after this methods has been called.
+     pub fn send_toast(&self, text: &str) {
+         let toast = adw::Toast::new(text);
+         self.imp().toast_overlay.add_toast(toast);
 --- /dev/null
 +++ b/src/document.rs
-@@ -0,0 +1,1024 @@
+@@ -0,0 +1,1239 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Document scans: find the page in a photo, straighten it and even out the
 +//! paper, without any image processing library.
@@ -608,12 +931,56 @@ changes had already put them on the filter without a restart).
 +    })
 +}
 +
++/// The page in a small RGB frame of the live preview (3 bytes per pixel,
++/// rows `stride` bytes apart), as corners in that frame's pixels, for the
++/// outline shown while framing the shot. Runs off the main thread.
++pub fn find_page_in_frame(width: usize, height: usize, stride: usize, rgb: &[u8]) -> Option<[Point; 4]> {
++    let mut data = Vec::with_capacity(width * height * 3);
++    for y in 0..height {
++        data.extend_from_slice(rgb.get(y * stride..y * stride + width * 3)?);
++    }
++    let img = downscale(&Rgb { w: width, h: height, data }, DETECT_SIZE);
++    let s = width as f64 / img.w as f64;
++    find_page(&img).map(|c| c.map(|(x, y)| ((x + 0.5) * s, (y + 0.5) * s)))
++}
++
 +/// How a page is saved, chosen in the adjust dialog.
 +#[derive(Clone, Copy, Debug, Default)]
 +pub struct ScanOptions {
 +    /// Quarter turns clockwise of the finished page.
 +    pub quarter_turns: u8,
-+    pub black_white: bool,
++    pub filter: ScanFilter,
++}
++
++/// What is done to the straightened page.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum ScanFilter {
++    /// As photographed, only cut out and straightened.
++    Off,
++    /// Paper evened out to white, cleaned up like a scanner.
++    #[default]
++    Clean,
++    /// Cleaned up, then grey levels with ink to black.
++    BlackWhite,
++}
++
++impl ScanFilter {
++    /// The `document-filter` setting's value.
++    pub fn as_str(self) -> &'static str {
++        match self {
++            Self::Off => "off",
++            Self::Clean => "clean",
++            Self::BlackWhite => "black-white",
++        }
++    }
++
++    pub fn from_str(s: &str) -> Self {
++        match s {
++            "off" => Self::Off,
++            "black-white" => Self::BlackWhite,
++            _ => Self::Clean,
++        }
++    }
 +}
 +
 +/// Straightens and evens out the page within `corners` (photo pixels, any
@@ -625,9 +992,11 @@ changes had already put them on the filter without a restart).
 +    out: &Path,
 +) -> anyhow::Result<()> {
 +    let mut page = warp(&prep.photo, &order_corners(*corners));
-+    whiten(&mut page);
-+    enhance(&mut page);
-+    if options.black_white {
++    if options.filter != ScanFilter::Off {
++        let gain = whiten(&mut page);
++        enhance(&mut page, &gain);
++    }
++    if options.filter == ScanFilter::BlackWhite {
 +        black_white(&mut page);
 +    }
 +    let page = rotate(page, options.quarter_turns);
@@ -755,14 +1124,18 @@ changes had already put them on the filter without a restart).
 +        }
 +    }
 +    masks.push(("colours rare on the border".into(), border_colour_mask(img)));
++    masks.push(("grown from the paper".into(), grown_mask(img, &luma, t1, 0.06)));
 +
 +    // Of the outlines that are mostly filled (one reaching over the desk is
 +    // mostly empty) and have real edges (at least half the sharpest step
-+    // found; a cut through the page has none), take the largest: a sharp
-+    // shadow edge inside the page must not win over the page's own edge.
-+    let mut found: Vec<([Point; 4], f64, f64)> = Vec::new();
++    // found; a cut through the page has none), take the one grown from the
++    // paper, which crosses shadows and stops at the page's edge; failing
++    // that, the largest: a sharp shadow edge inside the page must not win
++    // over the page's own edge.
++    let mut found: Vec<([Point; 4], f64, f64, bool)> = Vec::new();
 +    for (name, mask) in &masks {
-+        let Some((quad, area, fill)) = page_from_mask(mask, w, h) else {
++        let grown = name.starts_with("grown");
++        let Some((quad, area, fill)) = page_from_mask(mask, w, h, grown) else {
 +            continue;
 +        };
 +        let contrast = edge_contrast(&luma, w, h, &quad);
@@ -772,15 +1145,85 @@ changes had already put them on the filter without a restart).
 +            quad.map(|(x, y)| (x as i32, y as i32))
 +        );
 +        if fill >= 0.75 {
-+            found.push((quad, area, contrast));
++            found.push((quad, area, contrast, grown));
 +        }
 +    }
 +    let sharpest = found.iter().map(|f| f.2).fold(0.0, f64::max);
 +    found
 +        .into_iter()
 +        .filter(|f| f.2 >= 0.5 * sharpest)
-+        .max_by(|a, b| a.1.total_cmp(&b.1))
++        .max_by(|a, b| a.3.cmp(&b.3).then(a.1.total_cmp(&b.1)))
 +        .map(|f| f.0)
++}
++
++/// The paper grown out from its brightest part, one pixel at a time, as long
++/// as brightness and colour change only gradually. A shadow across the page
++/// (often the tablet's own) darkens it over many pixels and is crossed; the
++/// page's edge against a desk or a binder is a sharp step, in brightness or
++/// in colour, and stops it. Ink stops it too, but the page around it is
++/// reached from elsewhere and the outline's hull covers it.
++fn grown_mask(img: &Rgb, luma: &[u8], bright: u8, tol: f64) -> Vec<bool> {
++    let (w, h) = (img.w, img.h);
++    // 3x3 box blur, as log brightness and chromaticity: a shadow scales all
++    // channels alike, so it changes only the first
++    let mut f = vec![[0f32; 3]; w * h];
++    for y in 0..h {
++        for x in 0..w {
++            let mut s = [0u32; 3];
++            let mut n = 0u32;
++            for yy in y.saturating_sub(1)..(y + 2).min(h) {
++                for xx in x.saturating_sub(1)..(x + 2).min(w) {
++                    let p = img.px(xx, yy);
++                    for c in 0..3 {
++                        s[c] += p[c] as u32;
++                    }
++                    n += 1;
++                }
++            }
++            let (r, g, b) = (s[0] as f32 / n as f32, s[1] as f32 / n as f32, s[2] as f32 / n as f32);
++            let sum = r + g + b + 12.0;
++            f[y * w + x] = [((r + g + b) / 3.0 + 4.0).ln(), r / sum, g / sum];
++        }
++    }
++    let tol = tol as f32;
++    let step_ok = |a: usize, b: usize| {
++        let (p, q) = (f[a], f[b]);
++        (p[0] - q[0]).abs() < 2.5 * tol && ((p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt() < 0.12 * tol
++    };
++
++    let seeds: Vec<bool> = luma.iter().map(|&l| l > bright).collect();
++    let Some(seed) = largest_component(&seeds, w, h) else {
++        return vec![false; w * h];
++    };
++    let mut grown = vec![false; w * h];
++    let mut queue = VecDeque::new();
++    for (x, y) in seed {
++        let i = y as usize * w + x as usize;
++        grown[i] = true;
++        queue.push_back(i);
++    }
++    while let Some(i) = queue.pop_front() {
++        let (x, y) = (i % w, i / w);
++        let mut visit = |j: usize| {
++            if !grown[j] && step_ok(i, j) {
++                grown[j] = true;
++                queue.push_back(j);
++            }
++        };
++        if x > 0 {
++            visit(i - 1);
++        }
++        if x + 1 < w {
++            visit(i + 1);
++        }
++        if y > 0 {
++            visit(i - w);
++        }
++        if y + 1 < h {
++            visit(i + w);
++        }
++    }
++    grown
 +}
 +
 +/// Chromaticity (r, g share of r + g + b) and luma of the paper, taken
@@ -924,7 +1367,12 @@ changes had already put them on the filter without a restart).
 +
 +/// The page's corners from a mask of page pixels, with the quad's area and
 +/// the share of it the mask fills.
-+fn page_from_mask(mask: &[bool], w: usize, h: usize) -> Option<([Point; 4], f64, f64)> {
++fn page_from_mask(
++    mask: &[bool],
++    w: usize,
++    h: usize,
++    refine: bool,
++) -> Option<([Point; 4], f64, f64)> {
 +    let mut fg = mask.to_vec();
 +    fg = morph(&fg, w, h, false); // open: drop specks
 +    fg = morph(&fg, w, h, true);
@@ -936,15 +1384,90 @@ changes had already put them on the filter without a restart).
 +        return None;
 +    }
 +
++    let mut page = vec![false; w * h];
++    for &(x, y) in &blob {
++        page[y as usize * w + x as usize] = true;
++    }
 +    let hull = convex_hull(blob);
-+    let quad = reduce_to_quad(hull)?;
++    let quad = order_corners(reduce_to_quad(hull)?);
++    let fill = fill_ratio(&fg, w, h, &quad);
++    let quad = if refine { refine_quad(&page, w, h, quad) } else { quad };
 +    let area = polygon_area(&quad);
 +    if area < MIN_PAGE_AREA * (w * h) as f64 {
 +        return None;
 +    }
-+    let quad = order_corners(quad);
-+    let fill = fill_ratio(&fg, w, h, &quad);
 +    Some((quad, area, fill))
++}
++
++/// Moves the corners to where the quad covers the most page pixels, each
++/// pixel of something else inside it costing two. The hull reaches out to
++/// anything joined to the page, like a white label above it or the edges
++/// of the sheets below; a strip like that brings more background with it
++/// than page, so the sides settle on the page's own edges.
++fn refine_quad(page: &[bool], w: usize, h: usize, mut q: [Point; 4]) -> [Point; 4] {
++    // per row, the number of page pixels left of each x
++    let mut prefix = vec![0u32; (w + 1) * h];
++    for y in 0..h {
++        for x in 0..w {
++            prefix[y * (w + 1) + x + 1] = prefix[y * (w + 1) + x] + page[y * w + x] as u32;
++        }
++    }
++    let score = |q: &[Point; 4]| -> i64 {
++        let mut s = 0i64;
++        let ymin = q.iter().map(|p| p.1).fold(f64::MAX, f64::min).ceil().max(0.0) as usize;
++        let ymax = q.iter().map(|p| p.1).fold(f64::MIN, f64::max).floor().min(h as f64 - 1.0);
++        if ymax < 0.0 {
++            return i64::MIN;
++        }
++        for y in ymin..=ymax as usize {
++            // the convex quad's span on this row
++            let yf = y as f64;
++            let (mut x0, mut x1) = (f64::MAX, f64::MIN);
++            for i in 0..4 {
++                let (a, b) = (q[i], q[(i + 1) % 4]);
++                if (a.1 <= yf && yf <= b.1) || (b.1 <= yf && yf <= a.1) {
++                    let x = if (b.1 - a.1).abs() < 1e-9 { a.0 } else { a.0 + (b.0 - a.0) * (yf - a.1) / (b.1 - a.1) };
++                    x0 = x0.min(x);
++                    x1 = x1.max(x);
++                }
++            }
++            if x0 > x1 {
++                continue;
++            }
++            let (l, r) = (x0.ceil().max(0.0) as usize, (x1.floor() + 1.0).min(w as f64).max(0.0) as usize);
++            if l >= r {
++                continue;
++            }
++            let inside = (prefix[y * (w + 1) + r] - prefix[y * (w + 1) + l]) as i64;
++            s += 3 * inside - 2 * (r - l) as i64;
++        }
++        s
++    };
++    let mut best = score(&q);
++    for step in [8.0, 4.0, 2.0, 1.0] {
++        loop {
++            let mut moved = false;
++            for i in 0..4 {
++                for (dx, dy) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
++                    let mut t = q;
++                    t[i] = (
++                        (t[i].0 + dx * step).clamp(0.0, w as f64 - 1.0),
++                        (t[i].1 + dy * step).clamp(0.0, h as f64 - 1.0),
++                    );
++                    let s = score(&t);
++                    if s > best {
++                        best = s;
++                        q = t;
++                        moved = true;
++                    }
++                }
++            }
++            if !moved {
++                break;
++            }
++        }
++    }
++    q
 +}
 +
 +/// Share of the pixels inside the convex quad that are set in the mask.
@@ -1183,8 +1706,9 @@ changes had already put them on the filter without a restart).
 +/// Even out the paper: estimate its level per 32x32 block and colour
 +/// channel from the brightest pixels (paper, not ink), smooth that, and
 +/// scale each channel so the paper ends up neutral white. Shadows,
-+/// vignetting and the light's tint go; ink stays dark.
-+fn whiten(img: &mut Rgb) {
++/// vignetting and the light's tint go; ink stays dark. Returns the gain per
++/// pixel (brightness), which is how much its noise was amplified.
++fn whiten(img: &mut Rgb) -> Vec<f32> {
 +    const B: usize = 32;
 +    let (bw, bh) = (img.w.div_ceil(B), img.h.div_ceil(B));
 +    // paper level per block and channel; the block is ranked by luma so the
@@ -1232,6 +1756,7 @@ changes had already put them on the filter without a restart).
 +            }
 +        }
 +    }
++    let mut gains = vec![0f32; img.w * img.h];
 +    for y in 0..img.h {
 +        let gy = ((y as f64 + 0.5) / B as f64 - 0.5).clamp(0.0, (bh - 1) as f64);
 +        let (y0, fy) = (gy.floor() as usize, gy.fract());
@@ -1245,11 +1770,13 @@ changes had already put them on the filter without a restart).
 +                let top = grid[y0 * bw + x0][c] * (1.0 - fx) + grid[y0 * bw + x1][c] * fx;
 +                let bot = grid[y1 * bw + x0][c] * (1.0 - fx) + grid[y1 * bw + x1][c] * fx;
 +                let paper = (top * (1.0 - fy) + bot * fy).max(24.0);
-+                let gain = (245.0 / paper).clamp(0.8, 4.0);
++                let gain = (245.0 / paper).clamp(0.8, 12.0);
 +                img.data[i + c] = (img.data[i + c] as f64 * gain).min(255.0).round() as u8;
++                gains[y * img.w + x] += [0.299, 0.587, 0.114][c] * gain as f32;
 +            }
 +        }
 +    }
++    gains
 +}
 +
 +/// Make the evened-out page read like a scan. The page's own noise is
@@ -1266,7 +1793,10 @@ changes had already put them on the filter without a restart).
 +///   lines, pencil) gain contrast instead of fading. Weak chroma and chroma
 +///   on near-white paper go, so paper is white and black ink neutral, while
 +///   coloured marks keep their colour.
-+fn enhance(img: &mut Rgb) {
++///
++/// Where `gain` (from `whiten`) lifted a shadow, the noise was lifted with
++/// it, and smoothing and colour removal reach further there.
++fn enhance(img: &mut Rgb, gain: &[f32]) {
 +    let (w, h) = (img.w, img.h);
 +    if w < 5 || h < 5 {
 +        return;
@@ -1305,6 +1835,12 @@ changes had already put them on the filter without a restart).
 +    let (paper, noise) = paper_noise(&ym);
 +    let reach = 2.5 * noise.max(1.0);
 +    log::debug!("paper level {paper:.0}, noise {noise:.1}");
++    // noise relative to the page's typical place: 1 on lit paper, the
++    // extra gain in a shadow
++    let mut sorted_gain = gain.to_vec();
++    sorted_gain.sort_unstable_by(f32::total_cmp);
++    let typical = sorted_gain[n / 2].max(0.1);
++    let rel: Vec<f32> = gain.iter().map(|&g| (g / typical).max(1.0)).collect();
 +
 +    let mut yd = vec![0f32; n];
 +    let mut cbd = vec![0f32; n];
@@ -1312,6 +1848,7 @@ changes had already put them on the filter without a restart).
 +    for yy in 0..h as isize {
 +        for x in 0..w as isize {
 +            let c = ym[yy as usize * w + x as usize];
++            let reach = reach * rel[yy as usize * w + x as usize];
 +            let (mut s, mut k) = (0f32, 0f32);
 +            let (mut sb, mut sr) = (0f32, 0f32);
 +            for dy in -2..=2 {
@@ -1359,7 +1896,8 @@ changes had already put them on the filter without a restart).
 +        // purple fringe of sensor colour noise, while marker and pen
 +        // colours, far stronger, stay
 +        let strength = (cbd[i] * cbd[i] + crd[i] * crd[i]).sqrt();
-+        let keep = ((0.98 - l) / 0.10).clamp(0.0, 1.0) * ((strength - 10.0) / 15.0).clamp(0.0, 1.0);
++        let keep = ((0.98 - l) / 0.10).clamp(0.0, 1.0)
++            * ((strength - 10.0 * rel[i]) / (15.0 * rel[i])).clamp(0.0, 1.0);
 +        let l = l.powf(1.3) * 255.0;
 +        let (b, r) = (cbd[i] * keep, crd[i] * keep);
 +        let g = (l - 0.299 * (l + r) - 0.114 * (l + b)) / 0.587;
@@ -1546,12 +2084,13 @@ changes had already put them on the filter without a restart).
 +}
 --- /dev/null
 +++ b/src/scan_adjust.rs
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,451 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +//! Dialog to adjust a document scan before saving: the photo with the page
 +//! outline found in it and a handle on each corner to drag (with a
-+//! magnifier while dragging), buttons to turn the page, a black and white
-+//! switch, and "Add Page" to collect pages for a PDF.
++//! magnifier while dragging), buttons to turn the page, a choice of filter
++//! (none, cleaned up, black and white), and "Add Page" to collect pages for
++//! a PDF.
 +
 +use std::cell::{Cell, RefCell};
 +use std::rc::Rc;
@@ -1561,7 +2100,7 @@ changes had already put them on the filter without a restart).
 +use gtk::{cairo, gio, glib};
 +
 +use crate::config;
-+use crate::document::{Point, Prepared, ScanOptions};
++use crate::document::{Point, Prepared, ScanFilter, ScanOptions};
 +
 +/// Touch-friendly distance (in widget pixels) at which a handle is grabbed.
 +const GRAB_RADIUS: f64 = 40.0;
@@ -1726,7 +2265,7 @@ changes had already put them on the filter without a restart).
 +    ));
 +    area.add_controller(drag);
 +
-+    // Bottom bar: turn the page, black and white.
++    // Bottom bar: turn the page, filter.
 +    let turn_left = gtk::Button::builder()
 +        .icon_name("object-rotate-left-symbolic")
 +        .tooltip_text(gettext("Turn Left"))
@@ -1749,11 +2288,26 @@ changes had already put them on the filter without a restart).
 +            }
 +        ));
 +    }
-+    let bw_switch = gtk::Switch::builder()
++    let filters = adw::ToggleGroup::builder()
 +        .valign(gtk::Align::Center)
-+        .active(settings.boolean("document-black-white"))
++        .css_classes(["round"])
 +        .build();
-+    let bw_label = gtk::Label::new(Some(&gettext("Black & White")));
++    for (filter, label, tooltip) in [
++        (ScanFilter::Off, gettext("Off"), gettext("Only cut out and straighten the page")),
++        (ScanFilter::Clean, gettext("Filter"), gettext("Whiten the paper and sharpen the text")),
++        (ScanFilter::BlackWhite, gettext("B&W"), gettext("Filter, then black and white")),
++    ] {
++        filters.add(
++            adw::Toggle::builder()
++                .name(filter.as_str())
++                .label(label)
++                .tooltip(tooltip)
++                .build(),
++        );
++    }
++    filters.set_active_name(Some(
++        ScanFilter::from_str(&settings.string("document-filter")).as_str(),
++    ));
 +    let bar = gtk::Box::builder()
 +        .orientation(gtk::Orientation::Horizontal)
 +        .spacing(12)
@@ -1776,8 +2330,7 @@ changes had already put them on the filter without a restart).
 +    bar.append(&turn_left);
 +    bar.append(&turn_right);
 +    bar.append(&hint);
-+    bar.append(&bw_label);
-+    bar.append(&bw_switch);
++    bar.append(&filters);
 +
 +    let (sender, receiver) = futures_channel::oneshot::channel::<Option<Choice>>();
 +    let sender = Rc::new(RefCell::new(Some(sender)));
@@ -1840,7 +2393,7 @@ changes had already put them on the filter without a restart).
 +            #[weak]
 +            dialog,
 +            #[weak]
-+            bw_switch,
++            filters,
 +            #[strong]
 +            view,
 +            #[strong]
@@ -1848,14 +2401,14 @@ changes had already put them on the filter without a restart).
 +            #[strong]
 +            finish,
 +            move |_| {
-+                let black_white = bw_switch.is_active();
-+                let _ = settings.set_boolean("document-black-white", black_white);
++                let filter = ScanFilter::from_str(&filters.active_name().unwrap_or_default());
++                let _ = settings.set_string("document-filter", filter.as_str());
 +                LAST_TURNS.set(view.turns.get());
 +                finish(Some(Choice {
 +                    corners: *view.corners.borrow(),
 +                    options: ScanOptions {
 +                        quarter_turns: view.turns.get(),
-+                        black_white,
++                        filter,
 +                    },
 +                    add_page,
 +                }));
@@ -1982,6 +2535,170 @@ changes had already put them on the filter without a restart).
 +        cr.set_line_width(3.0);
 +        cr.stroke().ok();
 +    }
++}
+--- /dev/null
++++ b/aperture/src/frame_sampler.rs
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Hands small RGB copies of the preview to the app (as "frame-sample" bus
++//! messages), for analysis such as the live page outline in document mode.
++use std::sync::LazyLock;
++
++use gst_video::{prelude::*, video_frame::VideoFrameRef};
++use gtk::glib;
++
++/// Width of the frames handed out; the height follows the aspect ratio.
++pub(crate) const SAMPLE_WIDTH: i32 = 320;
++/// Frames handed out per second, at most.
++const SAMPLE_RATE: i32 = 5;
++
++mod imp {
++    use gst::{BufferRef, subclass::prelude::*};
++    use gst_video::subclass::prelude::*;
++
++    use super::*;
++
++    #[derive(Default)]
++    pub struct FrameSampler {}
++
++    #[glib::object_subclass]
++    impl ObjectSubclass for FrameSampler {
++        const NAME: &'static str = "ApertureFrameSampler";
++        type Type = super::FrameSampler;
++        type ParentType = gst_video::VideoFilter;
++    }
++
++    impl ObjectImpl for FrameSampler {}
++    impl GstObjectImpl for FrameSampler {}
++
++    impl ElementImpl for FrameSampler {
++        fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
++            static ELEMENT_METADATA: LazyLock<gst::subclass::ElementMetadata> =
++                LazyLock::new(|| {
++                    gst::subclass::ElementMetadata::new(
++                        "Frame sampler",
++                        "Filter/Video",
++                        "Posts copies of RGB frames on the bus",
++                        "surface-kit",
++                    )
++                });
++
++            Some(&*ELEMENT_METADATA)
++        }
++
++        fn pad_templates() -> &'static [gst::PadTemplate] {
++            static PAD_TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
++                let caps = gst_video::video_make_raw_caps(&[gst_video::VideoFormat::Rgb]).build();
++                vec![
++                    gst::PadTemplate::new(
++                        "src",
++                        gst::PadDirection::Src,
++                        gst::PadPresence::Always,
++                        &caps,
++                    )
++                    .unwrap(),
++                    gst::PadTemplate::new(
++                        "sink",
++                        gst::PadDirection::Sink,
++                        gst::PadPresence::Always,
++                        &caps,
++                    )
++                    .unwrap(),
++                ]
++            });
++
++            PAD_TEMPLATES.as_ref()
++        }
++    }
++
++    impl BaseTransformImpl for FrameSampler {
++        const MODE: gst_base::subclass::BaseTransformMode =
++            gst_base::subclass::BaseTransformMode::AlwaysInPlace;
++        const PASSTHROUGH_ON_SAME_CAPS: bool = true;
++        const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
++    }
++
++    impl VideoFilterImpl for FrameSampler {
++        fn transform_frame_ip_passthrough(
++            &self,
++            frame: &VideoFrameRef<&BufferRef>,
++        ) -> Result<gst::FlowSuccess, gst::FlowError> {
++            let Ok(data) = frame.plane_data(0) else {
++                return Ok(gst::FlowSuccess::Ok);
++            };
++            let structure = gst::Structure::builder("frame-sample")
++                .field("rgb", glib::Bytes::from(data))
++                .field("width", frame.width())
++                .field("height", frame.height())
++                .field("stride", frame.plane_stride()[0] as u32)
++                .build();
++            let msg = gst::message::Element::builder(structure)
++                .src(&*self.obj())
++                .build();
++            self.post_message(msg);
++            Ok(gst::FlowSuccess::Ok)
++        }
++    }
++}
++
++glib::wrapper! {
++    pub struct FrameSampler(ObjectSubclass<imp::FrameSampler>)
++        @extends gst::Object, gst::Element, gst_base::BaseTransform, gst_video::VideoFilter;
++}
++
++impl Default for FrameSampler {
++    fn default() -> Self {
++        glib::Object::new()
++    }
++}
++
++/// A tee branch: a few frames a second, scaled down to RGB, sampled. The
++/// queue in front drops frames rather than holding up the preview.
++pub(crate) fn create_bin() -> Result<gst::Element, glib::BoolError> {
++    let bin = gst::Bin::new();
++
++    let queue = gst::ElementFactory::make("queue")
++        .property_from_str("leaky", "downstream")
++        .property("max-size-buffers", 1u32)
++        .property("max-size-bytes", 0u32)
++        .property("max-size-time", 0u64)
++        .build()?;
++    let videorate = gst::ElementFactory::make("videorate").build()?;
++    videorate.set_property("max-rate", SAMPLE_RATE);
++    videorate.set_property("drop-only", true);
++    let videoscale = gst::ElementFactory::make("videoscale").build()?;
++    let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
++    let capsfilter = gst::ElementFactory::make("capsfilter").build()?;
++    let caps = gst::Caps::builder("video/x-raw")
++        .field("format", gst_video::VideoFormat::Rgb.to_str())
++        .field("width", SAMPLE_WIDTH)
++        .field("pixel-aspect-ratio", gst::Fraction::new(1, 1))
++        .build();
++    capsfilter.set_property("caps", &caps);
++    let sampler = FrameSampler::default().upcast::<gst::Element>();
++    let fakesink = gst::ElementFactory::make("fakesink")
++        .property("sync", false)
++        .property("async", false)
++        .build()?;
++
++    let elements = [
++        &queue,
++        &videorate,
++        &videoscale,
++        &videoconvert,
++        &capsfilter,
++        &sampler,
++        &fakesink,
++    ];
++    bin.add_many(elements)?;
++    gst::Element::link_many(elements)?;
++
++    let pad = queue.static_pad("sink").unwrap();
++    let ghost_pad = gst::GhostPad::with_target(&pad)?;
++    ghost_pad.set_active(true)?;
++    bin.add_pad(&ghost_pad)?;
++
++    Ok(bin.upcast())
 +}
 --- /dev/null
 +++ b/data/resources/icons/camera-autofocus-symbolic.svg

@@ -14,12 +14,23 @@
 //
 // ListWindows returns (class, instance, gtk app id, sandboxed app id, the app
 // GNOME tied it to, title) for each window, to see why matching fails.
+//
+// Screenshot(path) saves the whole screen as a PNG, for apps/ink. It is
+// only answered for that app (its script in the caller's command line):
+// anything else on the bus would otherwise get silent screenshots past
+// GNOME's screenshot permission.
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
+
+Gio._promisify(Shell.Screenshot.prototype, 'screenshot');
+Gio._promisify(Gio.DBusConnection.prototype, 'call');
+
+// the only caller Screenshot answers: apps/ink/ink.py
+const INK_SCRIPT = '/surface-kit/apps/ink/ink.py';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const IFACE = `<node>
@@ -27,6 +38,10 @@ const IFACE = `<node>
     <method name="ActivateApp">
       <arg type="s" direction="in" name="desktop_id"/>
       <arg type="b" direction="out" name="found"/>
+    </method>
+    <method name="Screenshot">
+      <arg type="s" direction="in" name="path"/>
+      <arg type="b" direction="out" name="done"/>
     </method>
     <method name="ListWindows">
       <arg type="a(ssssss)" direction="out" name="windows"/>
@@ -60,6 +75,37 @@ export default class SurfaceKitShellExtension extends Extension {
         }
         app.activate_full(-1, time);
         return true;
+    }
+
+    async ScreenshotAsync(params, invocation) {
+        const [path] = params;
+        try {
+            if (!await this._callerIsInk(invocation))
+                throw new Error('not the surface-kit ink app');
+            const file = Gio.File.new_for_path(path);
+            const stream = file.replace(null, false, Gio.FileCreateFlags.NONE, null);
+            await new Shell.Screenshot().screenshot(false, stream);
+            stream.close(null);
+            invocation.return_value(new GLib.Variant('(b)', [true]));
+        } catch (e) {
+            invocation.return_error_literal(Gio.DBusError, Gio.DBusError.ACCESS_DENIED,
+                `Screenshot failed: ${e.message}`);
+        }
+    }
+
+    async _callerIsInk(invocation) {
+        const [pid] = (await invocation.get_connection().call(
+            'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+            'GetConnectionUnixProcessID', new GLib.Variant('(s)', [invocation.get_sender()]),
+            new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, -1, null)).deepUnpack();
+        const [ok, bytes] = GLib.file_get_contents(`/proc/${pid}/cmdline`);
+        if (!ok)
+            return false;
+        // started through a link such as ~/.local/bin/ink: follow it
+        const real = arg => GLib.file_test(arg, GLib.FileTest.IS_SYMLINK)
+            ? GLib.file_read_link(arg) : arg;
+        const args = new TextDecoder().decode(bytes).split('\0');
+        return args.some(arg => arg && real(arg).endsWith(INK_SCRIPT));
     }
 
     ListWindows() {

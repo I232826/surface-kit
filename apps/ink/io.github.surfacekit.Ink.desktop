@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Screen Ink
+Comment=Write on a snapshot of the screen with the pen
+Exec=ink
+Icon=io.github.surfacekit.Ink
+Terminal=false
+Categories=Graphics;GTK;
+Keywords=annotate;draw;pen;screenshot;markup;Stift;
+StartupNotify=false
+DBusActivatable=false

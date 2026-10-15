@@ -10,6 +10,9 @@ doesn't let other programs do:
   in the desktop file), starts it if not. Windows are activated with a fresh
   server timestamp; with the time of the D-Bus call (none) mutter's focus
   stealing prevention only flagged the window.
+- `Screenshot(path)`: writes a PNG of the screen. Only answers Screen Ink
+  (`apps/ink/ink.py`, checked through the caller's command line), so nothing
+  else can grab the screen silently through it.
 - `ListWindows()`: class, instance, GTK app id, sandboxed app id, the app
   GNOME tied each window to, title.
 

@@ -23,6 +23,7 @@ APP_ID = "io.github.surfacekit.Pen"
 HERE = Path(__file__).resolve().parent
 # brings an app forward if it runs, starts it if not (shell/activate-app)
 ACTIVATE = str(HERE.parent.parent / "shell" / "activate-app")
+INK = str(HERE.parent / "ink" / "ink.py")
 
 # the Surface Pen through iptsd reports no serial: mutter's settings path
 STYLUS_SCHEMA = "org.gnome.desktop.peripherals.tablet.stylus"
@@ -405,6 +406,7 @@ ACTION_ICONS = {
     "overview": "focus-windows-symbolic",
     "apps": "view-app-grid-symbolic",
     "notifications": "preferences-system-notifications-symbolic",
+    "ink": "io.github.surfacekit.Ink",
     "command": "utilities-terminal-symbolic",
 }
 
@@ -424,6 +426,8 @@ def describe(top, gesture, accel):
         label = next(a[1] for a in SHELL_ACTIONS if a[0] == value)
         return label, ACTION_ICONS[value]
     if kind == "command":
+        if value == INK:
+            return "Screen Ink", ACTION_ICONS["ink"]
         app = app_of(value)
         if app:
             try:
@@ -471,7 +475,7 @@ class ActionChooserPage(Adw.NavigationPage):
                               homogeneous=True, min_children_per_line=3,
                               max_children_per_line=6, row_spacing=6, column_spacing=6)
         choices = [("none", "Nothing")] + [(a[0], a[1]) for a in SHELL_ACTIONS] + [
-            ("command", "Command…")]
+            ("ink", "Screen Ink"), ("command", "Command…")]
         for action_id, text in choices:
             child = Gtk.FlowBoxChild(child=tile(text, ACTION_ICONS[action_id], 40))
             child.add_css_class("card")
@@ -518,6 +522,8 @@ class ActionChooserPage(Adw.NavigationPage):
             app_id = value.get_id().removesuffix(".desktop")
             top.set_command(self.gesture, self.accel, f"Pen: {value.get_display_name()}",
                             f"{ACTIVATE} {app_id}")
+        elif value == "ink":
+            top.set_command(self.gesture, self.accel, "Pen: Screen Ink", INK)
         elif value == "none":
             top.clear(self.gesture, self.accel)
         elif value == "command":
@@ -532,7 +538,7 @@ class ActionChooserPage(Adw.NavigationPage):
         top = self.buttons.top
         kind, value = top.current(self.gesture, self.accel)
         dialog = Adw.AlertDialog(heading="Run a Command")
-        entry = Gtk.Entry(text=value if kind == "command" and not app_of(value) else "",
+        entry = Gtk.Entry(text=value if kind == "command" and not app_of(value) and value != INK else "",
                           activates_default=True,
             placeholder_text="e.g. nautilus ~/Downloads")
         dialog.set_extra_child(entry)

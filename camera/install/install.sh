@@ -26,6 +26,7 @@ depmod "$KVER"
 
 echo ">> modprobe config, loader, service"
 install -m 0644 "$HERE/surface-kit.conf" /etc/modprobe.d/surface-kit.conf
+install -m 0644 "$HERE/dracut-surface-kit.conf" /etc/dracut.conf.d/surface-kit.conf
 install -m 0755 "$HERE/surface-camera-load" /usr/local/sbin/surface-camera-load
 install -m 0644 "$HERE/surface-camera.service" /etc/systemd/system/surface-camera.service
 systemctl daemon-reload

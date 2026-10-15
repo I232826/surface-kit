@@ -1,0 +1,77 @@
+From: surface-kit
+Subject: [PATCH] media: ov5693: Windows power sequencing delays
+
+Intel's Windows sensor framework (SsSensor.c in the Surface camera DDK)
+waits after every supply it switches on and 20 ms after reset before the
+first access; Linux released reset right after enabling the supplies and
+waited 5-7.5 ms. On the Surface Pro 7 the front sensor's supply is a GPIO
+load switch (INT3472 pin 0x52), and its CSI-2 link only locked now and
+then, worst after many quick power cycles. Settle 10 ms after the clock and
+supplies, 20 ms after reset, and stay off at least 50 ms; all three are
+module parameters for testing.
+---
+--- a/ov5693.c	2026-10-15 16:10:28.757437596 +0200
++++ b/ov5693.c	2026-10-15 16:10:47.396185796 +0200
+@@ -763,6 +763,26 @@
+ 	return ret;
+ }
+ 
++/*
++ * Power sequencing delays, from Intel's Windows sensor framework (SsSensor.c
++ * in the Surface camera DDK): every supply gets time to settle before the
++ * next step, and the sensor 20 ms after reset before its first access. The
++ * Surface Pro 7 front sensor's supply is a GPIO load switch; taking the
++ * sensor out of reset while it still ramps (or switching it back on before
++ * it has drained) leaves the MIPI transmitter half initialised, and the
++ * CSI-2 link then only locks now and then.
++ */
++static unsigned int power_settle_ms = 10;
++module_param(power_settle_ms, uint, 0644);
++MODULE_PARM_DESC(power_settle_ms, "Wait after enabling the clock and supplies, ms (default 10)");
++static unsigned int reset_delay_ms = 20;
++module_param(reset_delay_ms, uint, 0644);
++MODULE_PARM_DESC(reset_delay_ms, "Wait after leaving reset before the first access, ms (default 20)");
++static unsigned int power_off_min_ms = 50;
++module_param(power_off_min_ms, uint, 0644);
++MODULE_PARM_DESC(power_off_min_ms, "Least time powered off before powering up again, ms (default 50)");
++static unsigned long ov5693_powered_off; /* jiffies, 0 = never */
++
+ static void ov5693_sensor_powerdown(struct ov5693_device *ov5693)
+ {
+ 	dev_dbg(ov5693->dev, "powerdown: reset-gpio=%d powerdown-gpio=%d\n",
+@@ -773,6 +793,7 @@
+ 	regulator_bulk_disable(OV5693_NUM_SUPPLIES, ov5693->supplies);
+ 
+ 	clk_disable_unprepare(ov5693->xvclk);
++	ov5693_powered_off = jiffies;
+ 	dev_dbg(ov5693->dev, "powerdown: done\n");
+ }
+ 
+@@ -786,6 +807,13 @@
+ 	gpiod_set_value_cansleep(ov5693->reset, 1);
+ 	gpiod_set_value_cansleep(ov5693->powerdown, 1);
+ 
++	if (ov5693_powered_off && power_off_min_ms) {
++		unsigned long ready = ov5693_powered_off + msecs_to_jiffies(power_off_min_ms);
++
++		if (time_before(jiffies, ready))
++			msleep(jiffies_to_msecs(ready - jiffies) + 1);
++	}
++
+ 	ret = clk_prepare_enable(ov5693->xvclk);
+ 	if (ret) {
+ 		dev_err(ov5693->dev, "Failed to enable clk\n");
+@@ -799,10 +827,12 @@
+ 	}
+ 
+ 	dev_dbg(ov5693->dev, "powerup: regulators enabled (avdd,dovdd,dvdd)\n");
++	if (power_settle_ms)
++		msleep(power_settle_ms);
+ 	gpiod_set_value_cansleep(ov5693->powerdown, 0);
+ 	gpiod_set_value_cansleep(ov5693->reset, 0);
+ 
+-	usleep_range(5000, 7500);
++	msleep(max(reset_delay_ms, 6U));
+ 
+ 	dev_dbg(ov5693->dev, "powerup: done\n");
+ 	return 0;

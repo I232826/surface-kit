@@ -1,0 +1,98 @@
+From: surface-kit
+Subject: [PATCH] daemon: keep ignoring the writing hand after the stylus leaves
+
+With DisableOnStylus, touch is switched off while the stylus is in
+proximity and back on at the first touch frame after it left. The pen
+leaves proximity between every stroke, while the hand keeps resting on the
+screen, so the palm turned into touches (several contacts at once) in each
+of those gaps.
+
+Remember the contacts that are on the screen when touch is enabled again
+and ignore them until they are lifted; contacts that start afterwards are
+handled as usual.
+---
+diff -ur a/src/apps/daemon/daemon.hpp b/src/apps/daemon/daemon.hpp
+--- a/src/apps/daemon/daemon.hpp	2026-10-15 18:11:20.349057583 +0200
++++ b/src/apps/daemon/daemon.hpp	2026-10-15 18:11:20.378387913 +0200
+@@ -60,9 +60,10 @@
+ 			return;
+ 
+ 		// Enable the touchscreen if it was disabled by a stylus that is no longer active.
++		// What touches the screen at that moment is the writing hand: keep ignoring it.
+ 		if (m_config.touchscreen_disable_on_stylus && m_stylus.has_value()) {
+ 			if (!m_stylus->active() && !m_touch->enabled())
+-				m_touch->enable();
++				m_touch->enable(contacts);
+ 		}
+ 
+ 		m_touch->update(contacts);
+diff -ur a/src/apps/daemon/touch.hpp b/src/apps/daemon/touch.hpp
+--- a/src/apps/daemon/touch.hpp	2026-10-15 18:11:20.329265274 +0200
++++ b/src/apps/daemon/touch.hpp	2026-10-15 18:11:20.378222555 +0200
+@@ -68,6 +68,14 @@
+ 	// Whether the device is enabled.
+ 	bool m_enabled = true;
+ 
++	/*
++	 * Contacts that were already on the screen when the device was enabled
++	 * again after the stylus left: the hand resting while writing (or one
++	 * holding the edge). They are ignored until they are lifted, so lifting
++	 * the pen between strokes doesn't turn the resting palm into touches.
++	 */
++	std::set<usize> m_suppressed {};
++
+ public:
+ 	TouchDevice(const core::Config &config, const core::DeviceInfo &info)
+ 		: m_config {config},
+@@ -137,13 +145,25 @@
+ 		if (!m_enabled)
+ 			return;
+ 
++		// Drop suppressed contacts, and forget those that were lifted.
++		std::vector<contacts::Contact<f64>> kept {};
++		std::set<usize> still {};
++		for (const contacts::Contact<f64> &contact : contacts) {
++			if (contact.index.has_value() && m_suppressed.count(contact.index.value()) > 0) {
++				still.insert(contact.index.value());
++				continue;
++			}
++			kept.push_back(contact);
++		}
++		m_suppressed = std::move(still);
++
+ 		// Find the inputs that need to be lifted
+-		this->search_lifted(contacts);
++		this->search_lifted(kept);
+ 
+-		if (this->is_blocked(contacts))
++		if (this->is_blocked(kept))
+ 			this->lift_all();
+ 		else
+-			this->process(contacts);
++			this->process(kept);
+ 
+ 		this->sync();
+ 	}
+@@ -188,6 +208,22 @@
+ 	}
+ 
+ 	/*!
++	 * Enables the touch device, ignoring the given contacts until they are lifted.
++	 *
++	 * @param[in] present The contacts that are on the screen right now.
++	 */
++	void enable(const std::vector<contacts::Contact<f64>> &present)
++	{
++		m_enabled = true;
++		m_suppressed.clear();
++
++		for (const contacts::Contact<f64> &contact : present) {
++			if (contact.index.has_value())
++				m_suppressed.insert(contact.index.value());
++		}
++	}
++
++	/*!
+ 	 * Whether the touch device is disabled or enabled.
+ 	 *
+ 	 * @return true if the touch device is enabled.

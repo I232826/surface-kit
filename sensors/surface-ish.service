@@ -1,0 +1,12 @@
+[Unit]
+Description=Surface Pro 7 sensor hub (patched intel-ish-ipc, auto-rotation)
+# Boot with surface_kit.noish to leave the hub alone.
+ConditionKernelCommandLine=!surface_kit.noish
+After=systemd-udev-settle.service systemd-modules-load.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/surface-ish load
+
+[Install]
+WantedBy=multi-user.target

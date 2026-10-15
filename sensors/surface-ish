@@ -1,0 +1,7 @@
+#!/bin/bash
+# Load the patched sensor hub driver (surface-ish.service); see README.md.
+set -u
+MODULE=/usr/local/lib/surface-kit/$(uname -r)/intel-ish-ipc.ko
+[ -e "$MODULE" ] || { echo "surface-ish: no $MODULE (sensors/install.sh for this kernel)" >&2; exit 0; }
+grep -q '^intel_ish_ipc ' /proc/modules && exit 0
+modprobe intel_ishtp && insmod "$MODULE"

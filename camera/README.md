@@ -60,11 +60,9 @@ The same build also carries two non-camera kernel fixes:
 - `patches/intel-ish-ipc/`: reverts the 6.19 sensor-hub start-up changes
   (upstream 507561b00ac2, 9e097dc9df80). Without it the ISH never finishes
   its handshake ("HBM haven't started") and there is no accelerometer, so
-  no auto-rotation (linux-surface#2140). **Not installed by default**: with
-  it the hub later stops answering ("timeout waiting for response from
-  ISHTP device") and from then on every suspend hangs the machine hard;
-  unloading it around suspend didn't help. `SURFACE_ISH=1 install.sh`
-  puts it in anyway.
+  no auto-rotation (linux-surface#2140). Built here, installed by
+  `sensors/install.sh` (see `sensors/README.md`): with it bound during
+  suspend the machine eventually hung hard on every sleep.
 - `patches/gpio_keys/0002`: ignores power-button presses for
   `resume_ignore_ms` (1500, set in `install/surface-kit.conf`) after resume,
   so the press that woke it or an impatient second press can't put it

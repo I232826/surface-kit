@@ -1,0 +1,87 @@
+From: surface-kit
+Subject: [PATCH] HID: intel-ish-hid: ipc: give up on a hub that did not survive sleep
+
+On the Surface Pro 7, re-initialising the sensor hub after a sleep it did
+not survive (ish_init() after resume from D3, or after an unanswered
+resume message) hangs the whole machine; so did unbinding the driver
+before sleep and binding it again after. Keep the hub in D0i3 across
+s2idle as usual, and if that fails remove its clients and leave it off:
+the sensors are gone until the next boot instead of the machine.
+reinit_after_sleep=1 restores the old behaviour.
+---
+--- a/ipc/pci-ish.c	2026-10-15 21:29:51.691354882 +0200
++++ b/ipc/pci-ish.c	2026-10-15 21:29:51.720240170 +0200
+@@ -270,6 +270,28 @@
+ 
+ static struct device __maybe_unused *ish_resume_device;
+ 
++/*
++ * Surface Pro 7: bringing the hub up again after a sleep it didn't survive
++ * (ish_init() from D3 or after an unanswered resume) hangs the whole
++ * machine. Give up on it instead: the sensors are gone until the next boot.
++ */
++static bool reinit_after_sleep;
++module_param(reinit_after_sleep, bool, 0644);
++MODULE_PARM_DESC(reinit_after_sleep,
++		 "Re-initialise the sensor hub if it didn't survive a sleep (hangs the Surface Pro 7)");
++
++static bool __maybe_unused ish_lost;
++
++static void __maybe_unused ish_give_up(struct ishtp_device *dev, const char *why)
++{
++	dev_warn(dev->devc, "sensor hub %s; not re-initialising it (sensors gone until reboot)\n",
++		 why);
++	ish_lost = true;
++	ish_disable_dma(dev);
++	ishtp_reset_handler(dev);
++	dev->dev_state = ISHTP_DEV_DISABLED;
++}
++
+ /**
+  * ish_resume_handler() - Work function to complete resume
+  * @work:	work struct
+@@ -302,14 +324,21 @@
+ 		 * If the flag is not cleared, something is wrong with ISH FW.
+ 		 * So on resume, need to go through init sequence again.
+ 		 */
+-		if (dev->resume_flag)
+-			ish_init(dev);
++		if (dev->resume_flag) {
++			if (reinit_after_sleep)
++				ish_init(dev);
++			else
++				ish_give_up(dev, "did not answer the resume");
++		}
+ 	} else {
+ 		/*
+ 		 * Resume from the D3, full reboot of ISH processor will happen,
+ 		 * so need to go through init sequence again.
+ 		 */
+-		ish_init(dev);
++		if (reinit_after_sleep)
++			ish_init(dev);
++		else
++			ish_give_up(dev, "was powered off in sleep");
+ 	}
+ }
+ 
+@@ -326,6 +355,9 @@
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct ishtp_device *dev = pci_get_drvdata(pdev);
+ 
++	if (ish_lost)
++		return 0;
++
+ 	if (ish_should_enter_d0i3(pdev)) {
+ 		/*
+ 		 * If previous suspend hasn't been asnwered then ISH is likely
+@@ -385,6 +417,9 @@
+ 	struct pci_dev *pdev = to_pci_dev(device);
+ 	struct ishtp_device *dev = pci_get_drvdata(pdev);
+ 
++	if (ish_lost)
++		return 0;
++
+ 	ish_resume_device = device;
+ 	dev->resume_flag = 1;
+ 

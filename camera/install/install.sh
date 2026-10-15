@@ -16,12 +16,10 @@ DEST="/lib/modules/$KVER/updates/surface-kit"
 echo ">> modules -> $DEST"
 install -d "$DEST"
 install -m 0644 "$OUT"/*.ko "$DEST/"
-# The sensor hub fix (patches/intel-ish-ipc) brings auto-rotation but the
-# hub later stops answering and every suspend then hangs the machine hard:
-# off unless asked for (SURFACE_ISH=1), and gone from earlier installs.
-if [ -z "${SURFACE_ISH:-}" ]; then
-    rm -f "$DEST/intel-ish-ipc.ko"
-fi
+# The sensor hub driver (patches/intel-ish-ipc) is built here but installed
+# by sensors/install.sh: loaded after boot and detached during sleep, never
+# from the module tree (suspending with it bound can hang the machine).
+rm -f "$DEST/intel-ish-ipc.ko"
 depmod "$KVER"
 
 echo ">> modprobe config, loader, service"

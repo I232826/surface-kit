@@ -1,0 +1,11 @@
+#!/bin/sh
+# systemd-sleep hook: after a longer sleep the sensor hub answers direct reads
+# again, but the data stream iio-sensor-proxy reads from stays silent, so
+# rotation is stuck. Restarting the proxy opens the stream afresh. Only
+# userspace is touched here; rebinding the hub's driver after sleep hangs the
+# machine (README.md). Delayed: the hub finishes waking in the background.
+[ "$1" = post ] || exit 0
+systemctl is-enabled --quiet surface-ish.service 2>/dev/null || exit 0
+systemd-run --no-block --quiet --on-active=3s --unit=surface-sensors-restart-$$ \
+    systemctl restart iio-sensor-proxy.service
+exit 0

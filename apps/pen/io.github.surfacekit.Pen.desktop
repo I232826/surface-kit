@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pen
+Comment=Surface Pen and touchscreen settings
+Exec=pen
+Icon=io.github.surfacekit.Pen
+Terminal=false
+Categories=Settings;HardwareSettings;GTK;
+Keywords=stylus;surface;pressure;palm;touch;Stift;Druck;
+StartupNotify=true

@@ -12,6 +12,10 @@ for app in "${@:-$(ls -d "$HERE"/*/ | xargs -n1 basename)}"; do
     ln -sf "$dir/$app.py" ~/.local/bin/"$app"
     chmod +x "$dir/$app.py"
     install -m 0644 "$dir"/*.desktop ~/.local/share/applications/
+    for svg in "$dir"/*.svg; do
+        [ -e "$svg" ] && install -D -m 0644 "$svg" ~/.local/share/icons/hicolor/scalable/apps/"$(basename "$svg")"
+    done
     echo ">> $app"
 done
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
+gtk-update-icon-cache -q -t ~/.local/share/icons/hicolor 2>/dev/null || true

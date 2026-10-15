@@ -1,0 +1,11 @@
+#!/bin/bash
+# Bring an app forward if it is open, start it if not (like the dock):
+#   activate-app <desktop id>        e.g. activate-app org.gnome.Nautilus
+# Uses the surface-kit-shell extension; without it, just starts the app.
+id="${1%.desktop}"
+[ -n "$id" ] || { echo "usage: $0 <desktop id>" >&2; exit 2; }
+out=$(gdbus call --session --dest org.gnome.Shell \
+      --object-path /io/github/surfacekit/Shell \
+      --method io.github.surfacekit.Shell.ActivateApp "$id.desktop" 2>/dev/null)
+[ "$out" = "(true,)" ] && exit 0
+exec gtk-launch "$id"

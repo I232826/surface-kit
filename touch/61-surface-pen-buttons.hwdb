@@ -1,0 +1,17 @@
+# Surface Pen top button (surface-kit), installed by touch/install.sh to
+# /etc/udev/hwdb.d/. The pen sends Super+F20 (click), Super+F19 (double
+# click) and Super+F18 (press and hold), but the xkb layouts turn F20 into
+# XF86AudioMicMute (so a click also toggled the microphone), give F19 no
+# symbol at all and F18 XF86Launch9: none could be bound, and with the key
+# unmatched GNOME took Super's release for the overview key. The program
+# keys (XF86Launch1-3) didn't work either: GNOME never delivers them. So
+# map them to F10 / F11 / F12, which every layout names as such; with the
+# Super the pen presses along they become Super+F10 / F11 / F12, which
+# GNOME leaves free. Left GUI stays Super, set explicitly so that applying
+# this resets an earlier mapping (udev only sets the keys listed). Scan
+# codes are the HID keyboard usages: 0x07006d-f the F keys, 0x0700e3 left GUI.
+evdev:name:Surface Pen Keyboard:*
+ KEYBOARD_KEY_7006d=f12
+ KEYBOARD_KEY_7006e=f11
+ KEYBOARD_KEY_7006f=f10
+ KEYBOARD_KEY_700e3=leftmeta

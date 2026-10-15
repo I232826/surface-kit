@@ -1,0 +1,23 @@
+#!/bin/bash
+# Helper for the Pen app, run as root through pkexec: set iptsd's touch
+# options in /etc/iptsd.d/90-surface-pro-7.conf and restart iptsd.
+#   pen-touch-apply DISABLE_ON_STYLUS DISABLE_ON_PALM ACTIVATION DEACTIVATION
+set -euo pipefail
+CONF=/etc/iptsd.d/90-surface-pro-7.conf
+TEMPLATE="$(cd "$(dirname "$(readlink -f "$0")")/../../touch" && pwd)/iptsd-surface-pro-7.conf"
+[ $# -eq 4 ] || { echo "usage: $0 true|false true|false N N" >&2; exit 2; }
+for b in "$1" "$2"; do [[ $b == true || $b == false ]] || exit 2; done
+for n in "$3" "$4"; do [[ $n =~ ^[0-9]{1,2}$ ]] || exit 2; done
+[ -f "$CONF" ] || install -D -m 0644 "$TEMPLATE" "$CONF"
+set_key() {
+    if grep -q "^$1 *=" "$CONF"; then
+        sed -i "s/^$1 *=.*/$1 = $2/" "$CONF"
+    else
+        printf '%s = %s\n' "$1" "$2" >> "$CONF"
+    fi
+}
+set_key DisableOnStylus "$1"
+set_key DisableOnPalm "$2"
+set_key ActivationThreshold "$3"
+set_key DeactivationThreshold "$4"
+systemctl restart 'iptsd@*'

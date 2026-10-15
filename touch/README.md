@@ -27,5 +27,7 @@ Debugging: `sudo stdbuf -oL timeout -s INT 20 libinput debug-events > log`
 renders every frame with its contacts (green valid, yellow unstable, red
 rejected), so settings can be tried offline.
 
-Pen top button: click Super+F20, double click Super+F19, hold Super+F18
-(not bound yet).
+Pen top button: the pen sends Super+F20 / F19 / F18, which the xkb layouts
+leave unbindable (F20 is the mic mute key, F19 has no symbol);
+`61-surface-pen-buttons.hwdb` maps them to Super+F10 / F11 / F12
+(installed by `install.sh`). The Pen app (`apps/pen`) binds them.

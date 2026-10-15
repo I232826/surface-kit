@@ -1,0 +1,7 @@
+{
+  "uuid": "surface-kit-shell@surface-kit",
+  "name": "surface-kit shell helper",
+  "description": "Lets surface-kit tools ask GNOME Shell to bring an app forward (or start it), like a click on it in the dock.",
+  "shell-version": ["50"],
+  "version": 1
+}

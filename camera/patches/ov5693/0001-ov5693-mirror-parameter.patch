@@ -3,9 +3,7 @@ Subject: [PATCH] media: i2c: ov5693: add a mirror module parameter
 
 Front-facing cameras usually feel natural mirrored, but libcamera always
 asks for the un-mirrored orientation. mirror=1 inverts the HFLIP control
-in the driver. The ISP flip bit is toggled together with the sensor one,
-so the media bus code (SBGGR10) is unchanged and no layout change needs
-to be reported.
+in the driver. (That the bus code stays the same was wrong: see 0005.)
 
 ---
 --- a/ov5693.c

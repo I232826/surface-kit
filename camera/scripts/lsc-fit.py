@@ -7,7 +7,8 @@ white paper held against the lens with light behind it, and fits per
 channel the gain 1 + k1 r^2 + k2 r^4 that flattens it, with r the distance
 from the centre over half the image width (the convention Lsc uses).
 
-usage: lsc-fit.py frame.bin [width height]      (default 3264 2448)
+usage: lsc-fit.py frame.bin [width height [ORDER]]   (default 3264 2448 BGGR;
+       GBRG is the Surface Pro 7 front camera with mirror=1)
 """
 import math
 import sys
@@ -19,7 +20,8 @@ GRID = 24            # blocks across the width
 
 def main():
     path = sys.argv[1]
-    w, h = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) == 4 else (3264, 2448)
+    w, h = (int(sys.argv[2]), int(sys.argv[3])) if len(sys.argv) >= 4 else (3264, 2448)
+    order = sys.argv[4] if len(sys.argv) >= 5 else "BGGR"
     a = array("H")
     a.frombytes(open(path, "rb").read())
     if len(a) < w * h:
@@ -28,8 +30,10 @@ def main():
     bw = (w // GRID) & ~1
     bh = bw
     half = w / 2.0
-    # BGGR: (0,0)=B (0,1)=G (1,0)=G (1,1)=R
-    planes = {"r": [(1, 1)], "g": [(0, 1), (1, 0)], "b": [(0, 0)]}
+    sites = {"r": [], "g": [], "b": []}
+    for site, ch in zip([(0, 0), (0, 1), (1, 0), (1, 1)], order.lower()):
+        sites[ch].append(site)
+    planes = sites
     blocks = []      # (r^2, {ch: mean})
     for by in range(0, h - bh + 1, bh):
         for bx in range(0, w - bw + 1, bw):

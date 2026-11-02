@@ -37,7 +37,7 @@ with gcc 11, we build with gcc 15 (kbuild warns; expected).
 | Camera | State |
 |--------|-------|
 | Rear ov8865 (8 MP, autofocus) | **Works.** 3264x1836/1920x1080 at 20 fps in GNOME Camera; autofocus, white balance, colour, denoise. |
-| Front ov5693 (5 MP) | **Parked: no.** Its CSI-2 link locks only now and then and degrades with use. Sensor registers, link rate and every receiver setting were swept, and the Windows driver's register tables match ours (compared with `scripts/win-regtables.py`; the tables aren't in this repo), so no software difference is left to find; likely the module or its cable. Ruled out 2026-10-15 as well: the PCH image clock (ICLK CLK2, off on Linux, on via `scripts/imgclk.py`: no difference) and power-up timing (`patches/ov5693/0004`, Windows DDK delays: no difference). Lock rate fell over days with unchanged software (6 Oct often clean, 15 Oct 0/16), which points at the flex cable or its connector. |
+| Front ov5693 (5 MP) | **Locks reliably with the shifted data-lane timing** (`patches/0016`, `csi2_shifted_ticks_port`, on by default in `install/surface-kit.conf`), from [ruslanbay/ipu4-drivers](https://github.com/ruslanbay/ipu4-drivers) RFC v2 11/12, reverse-engineered there from the Windows driver. Measured 2026-11-02 through libcamera, alternating in the same boot: 24/24 clean 30-frame starts with no relock bounces, against 4/24 with the usual delay counters. Before this it looked like a failing cable, because the lock rate fell over days and every setting we swept failed; that was wrong. Colour: `patches/ov5693/0005` reports GBRG with `mirror=1` (the flip shifts the Bayer order; check with `scripts/bayer-sites.py`), tuning in `libcamera/patches/0019`. Open: thin magenta line along the top edge, magenta at exactly 1296x972 (SoftISP 2:1 scaling), mild colour shift with a bright lamp in view. |
 | IR ov7251 | Never probes (`skip_fw_ports=6`). |
 
 What makes the rear camera good, and where it lives:
@@ -52,6 +52,7 @@ What makes the rear camera good, and where it lives:
   wobble tolerance, parked start), grey-locus AWB and colour matrices from
   the Windows calibration, lens shading, denoise pass, tuning files.
 - Windows driver data: `scripts/win-regtables.py` (sensor register tables),
+  `scripts/aiqb-to-lsc.py` (lens shading tables),
   `scripts/aiqb-dump.py` / `aiqb-to-ccm.py` (Intel AIQB tuning records;
   this SP7 is "Haven": front MSHW0190, rear MSHW0191).
 

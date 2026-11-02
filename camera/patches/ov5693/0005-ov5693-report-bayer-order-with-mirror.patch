@@ -1,0 +1,68 @@
+ov5693: report the Bayer order the sensor delivers with mirror=1
+
+The flip bits do change the Bayer order: with the horizontal flip off the
+sensor reads out GBRG while the driver reported SBGGR10, so libcamera took
+red and blue pixels for green and the image came out pink. Moving the
+window by one pixel (0x3800) has no effect on this sensor.
+
+--- a/ov5693.c	2026-11-02 13:31:29.390328218 +0100
++++ b/ov5693.c	2026-11-02 13:31:29.401444466 +0100
+@@ -395,13 +395,20 @@
+ 
+ /*
+  * Surface Pro 7 front camera: mirror the image (selfie view) by inverting
+- * whatever horizontal flip user space asks for. Both the sensor and the ISP
+- * flip bits are toggled, so the Bayer order stays SBGGR either way.
++ * whatever horizontal flip user space asks for. The Bayer order follows the
++ * flip: libcamera always asks for the flip on (the sensor is mounted rotated),
++ * which mirror=1 turns off, and the sensor then reads out GBRG rather than
++ * BGGR (measured on raw frames from the Surface Pro 7). Report that.
+  */
+ static bool mirror;
+-module_param(mirror, bool, 0644);
++module_param(mirror, bool, 0444);
+ MODULE_PARM_DESC(mirror, "Invert horizontal flip (mirrored selfie view)");
+ 
++static u32 ov5693_mbus_code(void)
++{
++	return mirror ? MEDIA_BUS_FMT_SGBRG10_1X10 : MEDIA_BUS_FMT_SBGGR10_1X10;
++}
++
+ static int ov5693_flip_vert_configure(struct ov5693_device *ov5693,
+ 				      bool enable)
+ {
+@@ -984,7 +991,7 @@
+ 
+ 	fmt->width = crop->width / hratio;
+ 	fmt->height = crop->height / vratio;
+-	fmt->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	fmt->code = ov5693_mbus_code();
+ 
+ 	format->format = *fmt;
+ 
+@@ -1201,7 +1208,7 @@
+ 	if (code->index > 0)
+ 		return -EINVAL;
+ 
+-	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
++	code->code = ov5693_mbus_code();
+ 	return 0;
+ }
+ 
+@@ -1213,7 +1220,7 @@
+ 	struct v4l2_rect *__crop;
+ 
+ 	/* Index 1 (the 2x2-binned size) is disabled: see ov5693_set_fmt() */
+-	if (fse->index > 0 || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
++	if (fse->index > 0 || fse->code != ov5693_mbus_code())
+ 		return -EINVAL;
+ 
+ 	__crop = __ov5693_get_pad_crop(ov5693, state, fse->pad, fse->which);
+@@ -1497,6 +1504,7 @@
+ 
+ 	ov5693->mode.crop = ov5693_default_crop;
+ 	ov5693->mode.format = ov5693_default_fmt;
++	ov5693->mode.format.code = ov5693_mbus_code();
+ 	ov5693->mode.vts = __ov5693_calc_vts(ov5693->mode.format.height);
+ 
+ 	ret = ov5693_init_controls(ov5693);

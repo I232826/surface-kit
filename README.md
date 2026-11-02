@@ -14,7 +14,7 @@ kernel modules and system packages, so read the README in each folder first.
 
 | Folder | What it does | State |
 |---|---|---|
-| [`camera/`](camera/README.md) | Kernel modules for the Intel IPU4P camera hardware, sensor and lens fixes | Rear camera works. Front camera doesn't: the link barely locks, most likely a hardware fault on this unit |
+| [`camera/`](camera/README.md) | Kernel modules for the Intel IPU4P camera hardware, sensor and lens fixes | Rear and front cameras lock reliably. Infrared camera isn't supported |
 | [`libcamera/`](camera/README.md) | libcamera rebuilt with autofocus, exposure, white balance, colour matrices, shading and denoise | Works |
 | [`snapshot/`](snapshot/README.md) | GNOME Camera with a document mode: page outline, crop, clean-up, multi-page PDF | Works |
 | [`sensors/`](sensors/README.md) | Sensor hub driver for auto-rotation, safe across suspend | Works |
@@ -29,7 +29,8 @@ kernel modules and system packages, so read the README in each folder first.
 
 ## Known problems
 
-- Front camera: see above.
+- Front camera: a thin magenta line along the top edge, a magenta picture at
+  exactly 1296x972, and a mild colour shift when a bright lamp is in view.
 - Speakers go silent now and then.
 - After a touch on a fullscreen window, GNOME stops sending that window the
   pen. Screen Ink runs maximized because of this.

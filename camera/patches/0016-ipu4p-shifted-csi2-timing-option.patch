@@ -1,0 +1,62 @@
+ipu4p: optional shifted CSI-2 data-lane timing (test for the front camera)
+
+What ruslanbay/ipu4-drivers RFC v2 11/12 programs on the Surface Pro 7 front
+camera, reverse-engineered there from the Windows driver. Off by default.
+
+--- a/ipu4/ipu4p-isys-csi2.c	2026-11-02 12:16:13.401798378 +0100
++++ b/ipu4/ipu4p-isys-csi2.c	2026-11-02 12:16:13.451769812 +0100
+@@ -111,6 +111,16 @@
+ 	}
+ }
+ 
++/*
++ * Shifted data-lane timing: what the Windows driver programs on the Surface
++ * Pro 7 front camera, per ruslanbay/ipu4-drivers RFC v2 11/12 (1269 ticks at
++ * 0x3c + lane * 8, none of the usual delay counters). Per CSI-2 port, -1 = off,
++ * e.g. csi2_shifted_ticks_port=-1,-1,1269
++ */
++static int csi2_shifted_ticks_port[8] = { [0 ... 7] = -1 };
++module_param_array(csi2_shifted_ticks_port, int, NULL, 0644);
++MODULE_PARM_DESC(csi2_shifted_ticks_port, "Per CSI-2 port shifted data-lane timing (-1 = usual delay counters)");
++
+ int ipu_isys_csi2_set_stream(struct v4l2_subdev *sd,
+ 			     struct ipu_isys_csi2_timing timing,
+ 			     unsigned int nlanes, int enable)
+@@ -151,18 +161,25 @@
+ 
+ 	ipu4p_csi2_ev_correction_params(csi2, nlanes);
+ 
+-	writel(timing.ctermen,
+-		   csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_CLANE);
+-	writel(timing.csettle,
+-		   csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_CLANE);
+-
+-	for (i = 0; i < nlanes; i++) {
+-		writel
+-		    (timing.dtermen,
+-		     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_DLANE(i));
+-		writel
+-		    (timing.dsettle,
+-		     csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_DLANE(i));
++	if (csi2->index < ARRAY_SIZE(csi2_shifted_ticks_port) &&
++	    csi2_shifted_ticks_port[csi2->index] >= 0) {
++		dev_info(&csi2->isys->adev->dev, "csi2-%u shifted timing %d, %u lanes\n",
++			 csi2->index, csi2_shifted_ticks_port[csi2->index], nlanes);
++		for (i = 0; i < nlanes; i++)
++			writel(csi2_shifted_ticks_port[csi2->index],
++			       csi2->base + 0x3c + i * 8);
++	} else {
++		writel(timing.ctermen,
++		       csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_CLANE);
++		writel(timing.csettle,
++		       csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_CLANE);
++
++		for (i = 0; i < nlanes; i++) {
++			writel(timing.dtermen,
++			       csi2->base + CSI2_REG_CSI_RX_DLY_CNT_TERMEN_DLANE(i));
++			writel(timing.dsettle,
++			       csi2->base + CSI2_REG_CSI_RX_DLY_CNT_SETTLE_DLANE(i));
++		}
+ 	}
+ 
+ 	val = readl(csi2->base + CSI2_REG_CSI_RX_CONFIG);

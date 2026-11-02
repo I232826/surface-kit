@@ -1,0 +1,45 @@
+ipa: simple: ov5693 tuning from real output
+
+Contrast 1.0 instead of the rear camera's 1.4 (orange skin), lens shading
+fitted on a flat field, white balance read from the brightest 25% of the
+picture rather than 2% (a lamp in view threw it off). The front camera only delivered usable frames after
+camera patch 0016 and ov5693/0005.
+
+--- a/src/ipa/simple/data/ov5693.yaml	2026-11-02 14:15:16.831534034 +0100
++++ b/src/ipa/simple/data/ov5693.yaml	2026-11-02 14:15:16.836555861 +0100
+@@ -12,7 +12,11 @@
+   # white balance from the brightest pixels, snapped onto the grey locus:
+   # sensor R/G, B/G of neutral grey under A, D50, D65 and D75 light, from
+   # the Windows driver's calibration (OV5693_MSHW0190_ICL.cpf)
++  # a lamp in view fills the brightest pixels with its glow, off the locus: read
++  # the light from more of the picture (K swing with the lamp toggled in view:
++  # 3063..4455 at 2%, 3683..4326 at 25%)
+   - Awb:
++      brightFraction: 0.25
+       locus: [ [ 1.074, 0.378 ], [ 0.648, 0.578 ], [ 0.588, 0.734 ], [ 0.563, 0.736 ] ]
+   # colour matrices from the Windows driver's tuning file
+   # (OV5693_MSHW0190_ICL.cpf), daylight/tungsten light sources
+@@ -34,12 +38,20 @@
+           ccm: [  1.7066, -0.6015, -0.1050,
+                  -0.2240,  1.6459, -0.4219,
+                  -0.0520, -0.4745,  1.5265 ]
+-  # same tone as the rear camera (tested there, not on this one)
++  # 1.4 like the rear camera pushed skin to orange (linear R/G 3.0, B/G 0.49 on
++  # a palm, against 2.4, 0.68 at 1.0; white paper unchanged) and deepened the
++  # dark corners.
+   - Adjust:
+-      contrast: 1.4
++      contrast: 1.0
++  # lens shading, fitted on a flat field (camera/scripts/lsc-fit.py, order GBRG);
++  # the corners of the full 4:3 frame are ~3.5x darker than the centre, in line
++  # with the Windows driver's tables.
++  - Lsc:
++      k1: [ 1.6489, 1.5076, 1.3013 ]
++      k2: [ 0.2272, 0.1637, 0.1857 ]
+   - Agc:
+       target: 1.6
+-  # edge-preserving noise reduction, as on the rear camera (untested here)
++  # edge-preserving noise reduction, as on the rear camera
+   - Denoise:
+       sigma: 2.8
+       maxSigma: 16

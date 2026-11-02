@@ -1,0 +1,52 @@
+media: ov5693: output the full crop only (Surface Pro 7 front camera)
+
+On the Surface Pro 7 the 2x2-binned modes produce only CSI-2 frame sync errors
+and no frames. Stop offering them; libcamera's software ISP scales instead.
+
+--- a/drivers/media/i2c/ov5693.c
++++ b/drivers/media/i2c/ov5693.c
+@@ -852,29 +852,18 @@
+ 	const struct v4l2_rect *crop;
+ 	struct v4l2_mbus_framefmt *fmt;
+ 	unsigned int hratio, vratio;
+-	unsigned int width, height;
+ 	unsigned int hblank;
+ 	int exposure_max;
+ 
+ 	crop = __ov5693_get_pad_crop(ov5693, state, format->pad, format->which);
+ 
+ 	/*
+-	 * Align to two to simplify the binning calculations below, and clamp
+-	 * the requested format at the crop rectangle
++	 * Surface Pro 7: the front camera's CSI-2 link reports only frame sync
++	 * errors in the 2x2-binned modes, so always output the full crop and
++	 * let the receiver side scale.
+ 	 */
+-	width = clamp_t(unsigned int, ALIGN(format->format.width, 2),
+-			OV5693_MIN_CROP_WIDTH, crop->width);
+-	height = clamp_t(unsigned int, ALIGN(format->format.height, 2),
+-			 OV5693_MIN_CROP_HEIGHT, crop->height);
+-
+-	/*
+-	 * We can only support setting either the dimensions of the crop rect
+-	 * or those dimensions binned (separately) by a factor of two.
+-	 */
+-	hratio = clamp_t(unsigned int,
+-			 DIV_ROUND_CLOSEST(crop->width, width), 1, 2);
+-	vratio = clamp_t(unsigned int,
+-			 DIV_ROUND_CLOSEST(crop->height, height), 1, 2);
++	hratio = 1;
++	vratio = 1;
+ 
+ 	fmt = __ov5693_get_pad_format(ov5693, state, format->pad,
+ 				      format->which);
+@@ -1082,7 +1071,8 @@
+ 	struct ov5693_device *ov5693 = to_ov5693_sensor(sd);
+ 	struct v4l2_rect *__crop;
+ 
+-	if (fse->index > 1 || fse->code != ov5693_mbus_code())
++	/* Index 1 (the 2x2-binned size) is disabled: see ov5693_set_fmt() */
++	if (fse->index > 0 || fse->code != ov5693_mbus_code())
+ 		return -EINVAL;
+ 
+ 	__crop = __ov5693_get_pad_crop(ov5693, state, fse->pad, fse->which);

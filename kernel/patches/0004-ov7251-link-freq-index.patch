@@ -1,0 +1,18 @@
+media: ov7251: use the index of the matched link frequency
+
+The loop looks for a firmware link frequency in the driver's link_freq[] and
+leaves its index in j, but link_freq_idx was set from i, the position in the
+firmware's list. With a single firmware entry of 319.2 MHz (the Surface's IR
+camera) i is 0, so the sensor was set up for and reported 240 MHz.
+
+--- a/drivers/media/i2c/ov7251.c
++++ b/drivers/media/i2c/ov7251.c
+@@ -1523,7 +1523,7 @@
+ 		goto out_free_bus_cfg;
+ 	}
+ 
+-	ov7251->link_freq_idx = i;
++	ov7251->link_freq_idx = j;
+ 
+ out_free_bus_cfg:
+ 	v4l2_fwnode_endpoint_free(&bus_cfg);

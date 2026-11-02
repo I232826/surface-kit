@@ -38,7 +38,7 @@ with gcc 11, we build with gcc 15 (kbuild warns; expected).
 |--------|-------|
 | Rear ov8865 (8 MP, autofocus) | **Works.** 3264x1836/1920x1080 at 20 fps in GNOME Camera; autofocus, white balance, colour, denoise. |
 | Front ov5693 (5 MP) | **Locks reliably with the shifted data-lane timing** (`patches/0016`, `csi2_shifted_ticks_port`, on by default in `install/surface-kit.conf`), from [ruslanbay/ipu4-drivers](https://github.com/ruslanbay/ipu4-drivers) RFC v2 11/12, reverse-engineered there from the Windows driver. Measured 2026-11-02 through libcamera, alternating in the same boot: 24/24 clean 30-frame starts with no relock bounces, against 4/24 with the usual delay counters. Before this it looked like a failing cable, because the lock rate fell over days and every setting we swept failed; that was wrong. Colour: `patches/ov5693/0005` reports GBRG with `mirror=1` (the flip shifts the Bayer order; check with `scripts/bayer-sites.py`), tuning in `libcamera/patches/0019`. Open: thin magenta line along the top edge, magenta at exactly 1296x972 (SoftISP 2:1 scaling), mild colour shift with a bright lamp in view. |
-| IR ov7251 | Never probes (`skip_fw_ports=6`). |
+| IR ov7251 | Never probes on this driver (`skip_fw_ports=6`). Works on the 7.4 kernel: see `kernel/` and `face/`. |
 
 What makes the rear camera good, and where it lives:
 

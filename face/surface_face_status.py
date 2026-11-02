@@ -2,6 +2,7 @@
 # animation: scan, match, fail or hide in /run/surface-kit-face/state. Howdy runs
 # this as root during login. Only the picture depends on it, so nothing here may
 # ever get in the way of the check itself.
+import atexit
 import os
 import time
 
@@ -26,7 +27,10 @@ def _write(state):
 
 def scanning():
 	_write("scan")
+	# however the check ends, the picture mustn't stay up
+	atexit.register(_write, "hide")
 
 
 def finished(code):
+	atexit.unregister(_write)
 	_write("match" if code == 0 else "fail" if code in FAILED else "hide")

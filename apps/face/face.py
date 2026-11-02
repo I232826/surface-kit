@@ -30,7 +30,8 @@ APPLY = str(HERE / "face-apply")
 sys.path.insert(0, str(HERE.parent.parent / "face"))
 
 CONFIG = Path("/etc/howdy/config.ini")
-MODELS = Path("/etc/howdy/models") / f"{getpass.getuser()}.dat"
+# names and dates only: the scans themselves are root's (face-apply)
+SCAN_NAMES = Path("/etc/howdy/scan-names") / f"{getpass.getuser()}.json"
 PAM_SUDO = Path("/etc/pam.d/sudo")
 PAM_LINE = "auth sufficient pam_howdy.so"
 
@@ -57,7 +58,7 @@ def read_config():
 
 def read_scans():
     try:
-        return json.loads(MODELS.read_text())
+        return json.loads(SCAN_NAMES.read_text())
     except (OSError, ValueError):
         return []
 

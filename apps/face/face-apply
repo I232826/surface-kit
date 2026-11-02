@@ -1,7 +1,7 @@
 #!/bin/bash
 # Helper for the Face app, run as root through pkexec: everything that needs
 # root for face login, for the user who started it.
-#   face-apply add LABEL | remove ID | test
+#   face-apply add LABEL | remove ID | test | lock
 #   face-apply set certainty|timeout|no_confirmation VALUE
 #   face-apply enabled true|false
 #   face-apply sudo on|off
@@ -11,21 +11,52 @@ PYTHON=/usr/local/lib/surface-kit/howdy-venv/bin/python
 COMPARE=/usr/local/lib/x86_64-linux-gnu/howdy/compare.py
 PAM=/etc/pam.d/sudo
 PAM_LINE="auth sufficient pam_howdy.so"
+MODELS=/etc/howdy/models
+# names and dates only, so the app can list scans without a password
+INDEX=/etc/howdy/scan-names
 
 [ -n "${PKEXEC_UID:-}" ] || { echo "run through pkexec" >&2; exit 2; }
 USER_NAME=$(id -nu "$PKEXEC_UID")
 
+# face scans are biometric data: root only
+lock_scans() {
+    install -d -m 700 "$MODELS"
+    chmod 600 "$MODELS"/*.dat 2>/dev/null || true
+    install -d -m 755 "$INDEX"
+    python3 -I - "$MODELS/$USER_NAME.dat" "$INDEX/$USER_NAME.json" <<'PY'
+import json, os, sys
+try:
+    scans = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    scans = []
+names = [{k: s[k] for k in ("id", "label", "time") if k in s} for s in scans]
+with open(sys.argv[2] + ".tmp", "w") as f:
+    json.dump(names, f)
+os.chmod(sys.argv[2] + ".tmp", 0o644)
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+PY
+}
+
 case "${1:-}" in
 add)
     [[ ${2:-} =~ ^[[:alnum:]\ _-]{1,24}$ ]] || { echo "bad label" >&2; exit 2; }
-    exec "$HOWDY" -U "$USER_NAME" -y add "$2"
+    status=0
+    "$HOWDY" -U "$USER_NAME" -y add "$2" || status=$?
+    lock_scans
+    exit "$status"
     ;;
 remove)
     [[ ${2:-} =~ ^[0-9]{1,6}$ ]] || { echo "bad id" >&2; exit 2; }
-    exec "$HOWDY" -U "$USER_NAME" -y remove "$2"
+    status=0
+    "$HOWDY" -U "$USER_NAME" -y remove "$2" || status=$?
+    lock_scans
+    exit "$status"
     ;;
 test)
     exec "$PYTHON" "$COMPARE" "$USER_NAME"
+    ;;
+lock)
+    lock_scans
     ;;
 set)
     case "${2:-}" in

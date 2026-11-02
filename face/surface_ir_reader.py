@@ -66,7 +66,12 @@ class surface_ir_reader:
 
 	def read(self):
 		if self.proc is None:
-			self._start()
+			# Not this kernel's camera (the older driver has no such route):
+			# let Howdy report a missing camera instead of a Python traceback
+			try:
+				self._start()
+			except (subprocess.CalledProcessError, OSError):
+				return False, None
 		raw = self.proc.stdout.read(FRAME_BYTES)
 		if raw is None or len(raw) != FRAME_BYTES:
 			return False, None

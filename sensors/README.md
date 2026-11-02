@@ -37,4 +37,5 @@ hub):
     sudo sensors/install.sh --remove     # back to the stock driver
 
 After a kernel update: `camera/build.sh`, then `sensors/install.sh` again
-(without a build for the running kernel the service does nothing).
+(without a build for the running kernel the service does nothing). A kernel from
+`kernel/` already has the patches in tree, so it only needs `sensors/install.sh`.

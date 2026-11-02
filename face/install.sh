@@ -38,5 +38,9 @@ set_option recording_plugin surface_ir
 # The room behind the face is mostly dark under the emitter alone
 set_option dark_threshold 90
 chmod 644 "$CONFIG"
+# Face scans are biometric data, root only. The Face app keeps a list of their
+# names in /etc/howdy/scan-names (apps/face/face-apply)
+install -d -m 700 /etc/howdy/models
+chmod 600 /etc/howdy/models/*.dat 2>/dev/null || true
 
 echo "Installed. PAM is unchanged. Next: sudo howdy add"

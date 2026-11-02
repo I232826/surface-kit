@@ -22,6 +22,8 @@ fi
 
 KVER="${1:-$(uname -r)}"
 KO="$HERE/../camera/out/$KVER/intel-ish-ipc.ko"
+# kernel/build.sh patches it in tree, so it comes with that kernel
+[ -e "$KO" ] || KO="/lib/modules/$KVER/kernel/drivers/hid/intel-ish-hid/intel-ish-ipc.ko"
 [ -e "$KO" ] || { echo "no $KO: run camera/build.sh" >&2; exit 1; }
 
 # never both: an override in updates/ would be loaded by udev at boot

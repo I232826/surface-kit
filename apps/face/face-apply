@@ -1,0 +1,59 @@
+#!/bin/bash
+# Helper for the Face app, run as root through pkexec: everything that needs
+# root for face login, for the user who started it.
+#   face-apply add LABEL | remove ID | test
+#   face-apply set certainty|timeout|no_confirmation VALUE
+#   face-apply enabled true|false
+#   face-apply sudo on|off
+set -euo pipefail
+HOWDY=/usr/local/bin/howdy
+PYTHON=/usr/local/lib/surface-kit/howdy-venv/bin/python
+COMPARE=/usr/local/lib/x86_64-linux-gnu/howdy/compare.py
+PAM=/etc/pam.d/sudo
+PAM_LINE="auth sufficient pam_howdy.so"
+
+[ -n "${PKEXEC_UID:-}" ] || { echo "run through pkexec" >&2; exit 2; }
+USER_NAME=$(id -nu "$PKEXEC_UID")
+
+case "${1:-}" in
+add)
+    [[ ${2:-} =~ ^[[:alnum:]\ _-]{1,24}$ ]] || { echo "bad label" >&2; exit 2; }
+    exec "$HOWDY" -U "$USER_NAME" -y add "$2"
+    ;;
+remove)
+    [[ ${2:-} =~ ^[0-9]{1,6}$ ]] || { echo "bad id" >&2; exit 2; }
+    exec "$HOWDY" -U "$USER_NAME" -y remove "$2"
+    ;;
+test)
+    exec "$PYTHON" "$COMPARE" "$USER_NAME"
+    ;;
+set)
+    case "${2:-}" in
+    certainty) [[ ${3:-} =~ ^[1-5](\.[0-9])?$ ]] || exit 2 ;;
+    timeout) [[ ${3:-} =~ ^[0-9]{1,2}$ ]] || exit 2 ;;
+    no_confirmation) [[ ${3:-} =~ ^(true|false)$ ]] || exit 2 ;;
+    *) exit 2 ;;
+    esac
+    sed -i "s/^$2 = .*/$2 = $3/" /etc/howdy/config.ini
+    ;;
+enabled)
+    case "${2:-}" in
+    true) sed -i "s/^disabled = .*/disabled = false/" /etc/howdy/config.ini ;;
+    false) sed -i "s/^disabled = .*/disabled = true/" /etc/howdy/config.ini ;;
+    *) exit 2 ;;
+    esac
+    ;;
+sudo)
+    case "${2:-}" in
+    on)
+        grep -qx "$PAM_LINE" "$PAM" ||
+            sed -i "0,/^@include common-auth/s//$PAM_LINE\n&/" "$PAM"
+        ;;
+    off) sed -i "/^$PAM_LINE\$/d" "$PAM" ;;
+    *) exit 2 ;;
+    esac
+    ;;
+*)
+    exit 2
+    ;;
+esac

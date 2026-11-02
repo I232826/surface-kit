@@ -6,11 +6,15 @@
 - [x] IR emitter runs from the sensor's strobe output (`kernel/patches/0006`)
 - [x] Howdy reads the camera (`face/`)
 - [x] Face match unlocks `sudo` in a local terminal, password still works
-- [ ] UI and animations for the unlock, in the spirit of Windows Hello but with
-      its own look:
-  1. Draft the animations
-  2. Build them once the look is approved
-- [ ] Login and lock screen (GDM), once `sudo` has proven itself
+- [x] Draft the unlock animation. Approved look, "Strobe", on a near-black tile:
+  - Scanning: a dot with three rings pulsing out, 1.5 s each, 0.5 s apart
+  - Match: everything turns teal and a check mark draws itself
+  - Failed: a coral ring and dot hold for 1 s, then shrink and fade over 0.8 s
+- [x] Face settings app (`apps/face`)
+- [x] Unlock animation for `sudo` (`shell/surface-face@surface-kit`,
+      `face/surface_face_status.py`)
+- [x] Face login and the animation on the login and lock screens
+      (`face/install-login.sh`)
 
 ## Kernel 7.4
 

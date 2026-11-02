@@ -16,5 +16,11 @@ doesn't let other programs do:
 - `ListWindows()`: class, instance, GTK app id, sandboxed app id, the app
   GNOME tied each window to, title.
 
+`surface-face@surface-kit` (installed system-wide by `face/install-login.sh`)
+draws the face unlock animation under the front camera, on the desktop, the
+lock screen and the login screen. It follows
+`/run/surface-kit-face/state` from Howdy (`face/surface_face_status.py`). It is
+a separate extension so the D-Bus methods above don't stay up while locked.
+
 `shell/activate-app <desktop id>` calls ActivateApp and falls back to
 starting the app; the Pen app's "Open an app" uses it.

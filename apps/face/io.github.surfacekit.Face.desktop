@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Face
+Comment=Face login settings and face scans
+Exec=face
+Icon=io.github.surfacekit.Face
+Terminal=false
+Categories=Settings;Security;GTK;
+Keywords=howdy;face;login;unlock;camera;infrared;Gesicht;Anmeldung;
+StartupNotify=true

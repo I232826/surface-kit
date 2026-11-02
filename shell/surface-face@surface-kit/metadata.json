@@ -1,0 +1,14 @@
+{
+  "uuid": "surface-face@surface-kit",
+  "name": "surface-kit face unlock",
+  "description": "Shows the face unlock animation while Howdy looks for a face, on the desktop, the lock screen and the login screen.",
+  "shell-version": [
+    "50"
+  ],
+  "session-modes": [
+    "user",
+    "unlock-dialog",
+    "gdm"
+  ],
+  "version": 1
+}

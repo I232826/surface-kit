@@ -1,8 +1,36 @@
+diff --git a/howdy/src/compare.py b/howdy/src/compare.py
+index 35e85fb..cc4b4ab 100644
+--- a/howdy/src/compare.py
++++ b/howdy/src/compare.py
+@@ -20,6 +20,7 @@ from datetime import timezone, datetime
+ import atexit
+ import subprocess
+ import snapshot
++import surface_face_status
+ import numpy as np
+ import _thread as thread
+ import paths_factory
+@@ -36,6 +37,7 @@ def exit(code=None):
+ 
+ 	# Exit compare
+ 	if code is not None:
++		surface_face_status.finished(code)
+ 		sys.exit(code)
+ 
+ 
+@@ -176,6 +178,7 @@ thread.start_new_thread(init_detector, (lock, ))
+ # Start video capture on the IR camera
+ timings["ic"] = time.time()
+ 
++surface_face_status.scanning()
+ video_capture = VideoCapture(config)
+ 
+ # Read exposure from config to use in the main loop
 diff --git a/howdy/src/meson.build b/howdy/src/meson.build
-index 36dc05e..9170a2f 100644
+index 36dc05e..f40c0c7 100644
 --- a/howdy/src/meson.build
 +++ b/howdy/src/meson.build
-@@ -34,6 +34,7 @@ py_sources = [
+@@ -34,12 +34,14 @@ py_sources = [
      'recorders/__init__.py',
      'recorders/ffmpeg_reader.py',
      'recorders/pyv4l2_reader.py',
@@ -10,6 +38,13 @@ index 36dc05e..9170a2f 100644
      'recorders/v4l2.py',
      'recorders/video_capture.py',
      'rubberstamps/__init__.py',
+     'rubberstamps/hotkey.py',
+     'rubberstamps/nod.py',
+     'snapshot.py',
++    'surface_face_status.py',
+     py_paths,
+ ]
+ 
 diff --git a/howdy/src/recorders/video_capture.py b/howdy/src/recorders/video_capture.py
 index 15888a5..f0bb358 100644
 --- a/howdy/src/recorders/video_capture.py

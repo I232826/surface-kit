@@ -24,6 +24,10 @@ as_user meson setup "$VENDOR/howdy-build" "$VENDOR/howdy-src" --prefix=/usr/loca
 as_user meson compile -C "$VENDOR/howdy-build"
 meson install -C "$VENDOR/howdy-build"
 
+# Where Howdy tells the shell extension how a check is going
+install -m644 "$HERE/surface-face-tmpfiles.conf" /etc/tmpfiles.d/surface-face.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/surface-face.conf
+
 install -d "$MODELS"
 install -m644 "$VENDOR"/howdy-models/*.dat "$MODELS/"
 

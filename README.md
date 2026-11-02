@@ -16,7 +16,7 @@ modules and system packages, so read the README in each folder first.
 | Folder | What it does | State |
 |---|---|---|
 | [`camera/`](camera/README.md) | Kernel modules for the Intel IPU4P camera hardware on 6.19, sensor and lens fixes | Rear and front cameras lock reliably. No infrared camera on this driver |
-| [`kernel/`](kernel/build.sh) | Builds 7.4-rc1 with the upstream IPU4P patches and our fixes | Rear, front and infrared cameras, rotation and a short suspend work. Long sleeps not tested yet |
+| [`kernel/`](kernel/build.sh) | Builds 7.4-rc1 with the upstream IPU4P patches and our fixes | Rear, front and infrared cameras, rotation and suspend work |
 | [`face/`](face/install.sh) | Face login with [Howdy](https://github.com/boltgolt/howdy) through the infrared camera and its light | Works for sudo, the login screen and the lock screen, on the 7.4 kernel |
 | [`libcamera/`](camera/README.md) | libcamera rebuilt with autofocus, exposure, white balance, colour matrices, shading and denoise | Works |
 | [`snapshot/`](snapshot/README.md) | GNOME Camera with a document mode: page outline, crop, clean-up, multi-page PDF | Works |

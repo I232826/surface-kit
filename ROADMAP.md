@@ -20,8 +20,8 @@
 
 - [x] Auto-rotation on this kernel
 - [x] Default boot
-- [ ] Long suspend test (a 5 minute sleep is fine)
-- [ ] Clean rebuild with all patches, and install it
+- [x] Suspend, short and long
+- [x] Clean rebuild with all patches, installed
 
 ## Upstream
 

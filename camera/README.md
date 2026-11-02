@@ -37,7 +37,7 @@ with gcc 11, we build with gcc 15 (kbuild warns; expected).
 | Camera | State |
 |--------|-------|
 | Rear ov8865 (8 MP, autofocus) | **Works.** 3264x1836/1920x1080 at 20 fps in GNOME Camera; autofocus, white balance, colour, denoise. |
-| Front ov5693 (5 MP) | **Parked: no.** Its CSI-2 link locks only now and then and degrades with use. Sensor registers, link rate and every receiver setting were swept, and the Windows driver's tables (`camera/windows/`) match ours, so no software difference is left to find; likely the module or its cable. Ruled out 2026-10-15 as well: the PCH image clock (ICLK CLK2, off on Linux, on via `scripts/imgclk.py`: no difference) and power-up timing (`patches/ov5693/0004`, Windows DDK delays: no difference). Lock rate fell over days with unchanged software (6 Oct often clean, 15 Oct 0/16), which points at the flex cable or its connector. |
+| Front ov5693 (5 MP) | **Parked: no.** Its CSI-2 link locks only now and then and degrades with use. Sensor registers, link rate and every receiver setting were swept, and the Windows driver's register tables match ours (compared with `scripts/win-regtables.py`; the tables aren't in this repo), so no software difference is left to find; likely the module or its cable. Ruled out 2026-10-15 as well: the PCH image clock (ICLK CLK2, off on Linux, on via `scripts/imgclk.py`: no difference) and power-up timing (`patches/ov5693/0004`, Windows DDK delays: no difference). Lock rate fell over days with unchanged software (6 Oct often clean, 15 Oct 0/16), which points at the flex cable or its connector. |
 | IR ov7251 | Never probes (`skip_fw_ports=6`). |
 
 What makes the rear camera good, and where it lives:

@@ -26,4 +26,4 @@
 ## Upstream
 
 - [ ] `ov7251` link frequency fix, `ov8865` and `dw9719` patches to linux-media
-- [ ] What's new from here in linux-surface discussion 1353
+- [x] What's new from here in linux-surface discussion 1353

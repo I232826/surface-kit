@@ -24,7 +24,7 @@ modules and system packages, so read the README in each folder first.
 | [`rotate/`](rotate/) | Rotation animation (GNOME Shell extension) | Works |
 | [`touch/`](touch/README.md) | iptsd tuning, palm rejection while writing, pen top-button keys | Works |
 | [`mutter/`](mutter/README.md) | Mutter with a dot instead of an arrow under the pen | Works |
-| [`audio/`](audio/README.md) | Internal mic levels | Mic works. Speakers sometimes go silent, not solved yet |
+| [`audio/`](audio/README.md) | Internal mic levels | Mic and speakers work |
 | [`power/`](camera/README.md) | Power button behaviour around suspend | Works |
 | [`system/`](system/install.sh) | Clock fix (the firmware loads a clock over a year behind at boot) | Works |
 | [`shell/`](shell/README.md) | GNOME Shell helper: focus-or-start an app, screenshot for Screen Ink. Face unlock animation | Works |
@@ -32,9 +32,6 @@ modules and system packages, so read the README in each folder first.
 
 ## Known problems
 
-- Front camera: a thin magenta line along the top edge, a magenta picture at
-  exactly 1296x972, and a mild colour shift when a bright lamp is in view.
-- Speakers go silent now and then.
 - Logging in by face leaves the GNOME keyring locked, because it needs your
   password to open. Apps that use it can ask for the password afterwards.
 - Face login is a convenience, not extra security. Howdy's project says the same.
